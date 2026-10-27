@@ -1,0 +1,1461 @@
+--[[ ULTRA REALISM SHADER v8 (eras, fog, shadows, lens flare, clouds, reflections, weather particles, camera movement, themes) — Roblox executor script (client-side)
+     Uses only Roblox Lighting / post-effect / Terrain properties. No custom GPU shaders, no network calls.
+     RightShift = show/hide menu | K = shaders on/off | round gold button = menu (touch) ]]
+
+local G = (getgenv and getgenv()) or _G
+if G.__TERA then pcall(G.__TERA) end -- safe to re-execute
+
+local Players, Lighting, TS, UIS = game:GetService("Players"), game:GetService("Lighting"), game:GetService("TweenService"), game:GetService("UserInputService")
+local RS, HS, MS = game:GetService("RunService"), game:GetService("HttpService"), game:GetService("MaterialService")
+local cam = workspace.CurrentCamera
+local terrain = workspace:FindFirstChildOfClass("Terrain")
+local touch = UIS.TouchEnabled
+local RH = touch and 44 or 34 -- row height (bigger touch targets on phones)
+local conns = {}
+local function conn(c) conns[#conns + 1] = c return c end
+for _, o in ipairs(Lighting:GetChildren()) do if string.sub(o.Name, 1, 5) == "TERA_" then o:Destroy() end end
+
+---------------------------------------------------------------- capabilities + originals
+local orig, has = {}, {}
+for _, p in ipairs({"Brightness","Ambient","OutdoorAmbient","ColorShift_Top","ColorShift_Bottom","ExposureCompensation","ClockTime","GlobalShadows","EnvironmentDiffuseScale","EnvironmentSpecularScale","ShadowSoftness","FogEnd","FogStart","FogColor","GeographicLatitude"}) do
+	local ok, v = pcall(function() return Lighting[p] end)
+	if ok then orig[p], has[p] = v, true end
+end
+local origTech; pcall(function() origTech = gethiddenproperty(Lighting, "Technology") end)
+local canTech = (sethiddenproperty ~= nil) and origTech ~= nil
+local origMat; pcall(function() origMat = MS.Use2022Materials end)
+local ow; if terrain then pcall(function() ow = {c = terrain.WaterColor, t = terrain.WaterTransparency, r = terrain.WaterReflectance} end) end
+
+local stash = {} -- the game's own post effects / atmosphere: hidden while shaders are on, restored after
+for _, o in ipairs(Lighting:GetChildren()) do
+	if o:IsA("PostEffect") then stash[#stash + 1] = {o, o.Enabled}
+	elseif o:IsA("Atmosphere") then stash[#stash + 1] = {o} end
+end
+local function setGame(hide)
+	for _, s in ipairs(stash) do
+		local o = s[1]
+		if o:IsA("Atmosphere") then
+			if hide then o.Parent = nil else o.Parent = Lighting end
+		else
+			if hide then o.Enabled = false else o.Enabled = s[2] end
+		end
+	end
+end
+
+---------------------------------------------------------------- effects (created once, reused forever)
+local function mk(c, n, p)
+	local o = Instance.new(c); o.Name = "TERA_" .. n
+	for k, v in pairs(p or {}) do o[k] = v end
+	o.Parent = Lighting
+	return o
+end
+local cc, bloom = mk("ColorCorrectionEffect", "Grade", {Enabled = false}), mk("BloomEffect", "Bloom", {Enabled = false})
+local sun = mk("SunRaysEffect", "Rays", {Enabled = false, Spread = 0.65})
+local bloom2 = mk("BloomEffect", "BloomWide", {Enabled = false})
+local dof = mk("DepthOfFieldEffect", "DoF", {Enabled = false, NearIntensity = 0, FocusDistance = 45, InFocusRadius = 70}) -- far blur only
+local atmo = mk("Atmosphere", "Atmo")
+
+---------------------------------------------------------------- era data (own colour science per era)
+local ERA = {
+	Medieval = {exposure=0.15, brightness=2.6, ambR=0.34, ambG=0.38, ambB=0.44, sunR=0.16, sunG=0.11, sunB=0.04, tintR=1, tintG=0.985, tintB=0.955,
+		sat=0.14, contrast=0.12, bloom=0.32, bsize=26, bthr=1, rays=0.12, fog=0.30, haze=1.2, glare=0.5, atR=0.73, atG=0.80, atB=0.89,
+		dcR=0.52, dcG=0.45, dcB=0.40, shadow=0.3, spec=1, wtR=0.18, wtG=0.42, wtB=0.50, wtT=0.75, wtF=0.6},
+	Samurai = {exposure=0.10, brightness=2.4, ambR=0.38, ambG=0.36, ambB=0.40, sunR=0.15, sunG=0.09, sunB=0.05, tintR=1, tintG=0.965, tintB=0.955,
+		sat=0.10, contrast=0.10, bloom=0.38, bsize=30, bthr=0.95, rays=0.20, fog=0.45, haze=2.4, glare=0.4, atR=0.84, atG=0.81, atB=0.86,
+		dcR=0.55, dcG=0.42, dcB=0.42, shadow=0.35, spec=1.1, wtR=0.16, wtG=0.36, wtB=0.34, wtT=0.80, wtF=0.7},
+	China = {exposure=0.12, brightness=2.7, ambR=0.40, ambG=0.37, ambB=0.33, sunR=0.20, sunG=0.12, sunB=0.03, tintR=1, tintG=0.96, tintB=0.915,
+		sat=0.20, contrast=0.16, bloom=0.42, bsize=28, bthr=0.9, rays=0.16, fog=0.35, haze=1.8, glare=0.7, atR=0.88, atG=0.83, atB=0.74,
+		dcR=0.56, dcG=0.46, dcB=0.36, shadow=0.25, spec=1, wtR=0.10, wtG=0.40, wtB=0.38, wtT=0.70, wtF=0.6},
+}
+local INFO = {
+	Medieval = {"Medieval Europe", "Sunlit castles, rich green countryside, soft blue distance haze, natural stone and timber.",
+		{Color3.fromRGB(94,140,70), Color3.fromRGB(196,170,120), Color3.fromRGB(120,150,190), Color3.fromRGB(212,160,70)}},
+	Samurai = {"Samurai Japan", "Maple red and sakura warmth, misty layered mountains, restrained colour, jade water.",
+		{Color3.fromRGB(176,64,48), Color3.fromRGB(232,176,190), Color3.fromRGB(110,140,96), Color3.fromRGB(190,184,200)}},
+	China = {"Imperial China", "Imperial gold and vermilion, jade water, warm palace light, hazy mountain valleys.",
+		{Color3.fromRGB(214,170,70), Color3.fromRGB(190,52,40), Color3.fromRGB(70,150,120), Color3.fromRGB(150,120,84)}},
+}
+local MD = {exp=0, amb=1, sun=1, warm=0, sat=0, bloom=1, fog=1, haze=0, glare=1, rays=1, con=0, spec=0, wet=0, cool=0, t={1,1,1}}
+local function M(t) return setmetatable(t, {__index = MD}) end
+local TOD = {["Auto (game time)"]=M{}, Day=M{clock=12.5}, ["Golden Hour"]=M{clock=16.6, sun=1.35, warm=0.5, amb=0.95},
+	Sunset=M{clock=17.8, sun=1.6, warm=1, amb=0.85, exp=-0.05, sat=0.04}, Night=M{clock=23, sun=0, amb=1.5, exp=0.4, warm=-0.4, sat=-0.04, bloom=1.4, fog=0.8}}
+local TOD_ORDER = {"Auto (game time)", "Day", "Golden Hour", "Sunset", "Night"}
+local WX = {Clear=M{}, Golden=M{warm=0.3, sun=1.2, glare=1.3}, Mist=M{fog=1.8, haze=1.5, glare=0.5, rays=0.6, sat=-0.04},
+	["Mountain Haze"]=M{fog=1.2, haze=2.8, glare=0.8}, Overcast=M{sun=0.35, amb=1.15, glare=0.2, rays=0.2, con=-0.05, sat=-0.06, exp=0.05},
+	Rain=M{fog=1.5, haze=1.2, glare=0, rays=0, sat=-0.1, exp=-0.05, cool=0.5, spec=0.4, wet=0.2}}
+local WX_ORDER = {"Clear", "Golden", "Mist", "Mountain Haze", "Overcast", "Rain"}
+local SEAS = {Spring=M{t={0.985,1,0.975}, sat=0.04}, Summer=M{}, Autumn=M{t={1.03,0.99,0.93}, sat=0.06}, Winter=M{t={0.96,0.99,1.04}, sat=-0.1}}
+local SEAS_ORDER = {"Spring", "Summer", "Autumn", "Winter"}
+local QN = {"Low", "Medium", "High", "Ultra"}
+local QT = {{bs=0.5, ray=0, dof=false, sh=0, fut=false, mat=false, vig=false, cl=0, lights=0, gloss=false, af=false, mb=false, fl=false, cs=false, pf=0}, {bs=0.75, ray=0.5, dof=false, sh=0.3, fut=true, mat=true, vig=true, cl=10, lights=2, gloss=true, af=false, mb=false, fl=true, cs=false, pf=0.5},
+	{bs=1, ray=1, dof=true, sh=0.7, fut=true, mat=true, vig=true, cl=22, lights=5, gloss=true, af=true, mb=true, fl=true, cs=true, pf=1}, {bs=1.15, ray=1, dof=true, sh=1, fut=true, mat=true, vig=true, cl=34, lights=10, gloss=true, af=true, mb=true, fl=true, cs=true, pf=1.5}}
+local RG = {sat={-1,1}, contrast={-1,1}, exposure={-3,3}, brightness={0,6}, bloom={0,3}, bsize={4,56}, bthr={0,2}, fog={0,0.7}, haze={0,10}, glare={0,10}, spec={0,2}}
+
+-- "neutral" = the game's own look; Intensity blends between this and the preset
+local function c3(c) return c.R, c.G, c.B end
+local N0 = {exposure=0, brightness=orig.Brightness or 2, sat=0, contrast=0, bloom=0, rays=0, fog=0, haze=0, glare=0, tintR=1, tintG=1, tintB=1,
+	shadow=orig.ShadowSoftness or 0.2, spec=orig.EnvironmentSpecularScale or 1}
+if orig.OutdoorAmbient then N0.ambR, N0.ambG, N0.ambB = c3(orig.OutdoorAmbient) end
+if orig.ColorShift_Top then N0.sunR, N0.sunG, N0.sunB = c3(orig.ColorShift_Top) end
+if ow then N0.wtR, N0.wtG, N0.wtB = c3(ow.c); N0.wtT, N0.wtF = ow.t, ow.r end
+
+---------------------------------------------------------------- state
+local DEFS = {enabled=true, era="Medieval", tod="Golden Hour", weather="Clear", season="Summer", quality=touch and "Medium" or "High",
+	vig=0.25, dof=false, dofAmt=0.3, water=true, lowPerf=false, autoperf=true, target=touch and 28 or 40,
+	cloudsOn=true, cloudCover=0.6, cloudStyle="Cumulus", cloudScale=1, cloudAlt=350, cloudSoft=0.3, windSpd=6, windDir=60, engClouds=true, engCover=0.45, engDens=0.5,
+	sunSize=24, moonSize=14, stars=4000, bodies=true, lat=orig.GeographicLatitude or 41.7, cycle=0, skyAmb=orig.EnvironmentDiffuseScale or 1,
+	lightSh=true, maxLights=5, lantWarm=0.3, lantBoost=1.15, gloss=true, glossAmt=0.08, pbr=true,
+	waveSize=0.25, waveSpd=10, uw=true, lush=false, grass=0.5, autoFocus=false, focusDist=60, sunGlare=true, eyeAdapt=true, mblur=false, bars=false, sway=false,
+	fogMode="Atmosphere", fogAmt=1.3, fogDist=1400, scatter=true, shadowDepth=1, contact=true, flare=true, flareAmt=1, autoExp=true, bloomWide=true,
+	bob=false, bobAmt=1, tilt=false, tiltAmt=1, landing=false, speedFov=false, zoomFov=28, orbit=false, orbitSpd=0.25, orbitDist=14,
+	particles="Dust", partAmt=1, lensDrops=true, dawnMist=true, tone="Filmic", grade="None", theme="Gold"}
+local DEFU = {intensity=1, exposure=0, contrast=0, sat=0, bloom=1, haze=1, glare=1, shadow=1, warmth=0, rays=1, spec=0}
+local S, U, CU = {}, {}, {}
+local function copyBase(id) for k, v in pairs(ERA[id]) do CU[k] = v end end
+local function resetAll() for k, v in pairs(DEFS) do S[k] = v end for k, v in pairs(DEFU) do U[k] = v end copyBase("Medieval") end
+resetAll()
+
+local autoCap, cur, tr = 4, nil, nil
+local last = {}
+local perfL, foot -- UI labels (assigned later)
+local function notify(t) if foot then foot.Text = t end end
+local function Qe() return QT[S.lowPerf and 1 or math.min(table.find(QN, S.quality) or 3, autoCap)] end
+
+local TONE = {Neutral = {c = 0, s = 0, e = 0, t = 0}, Filmic = {c = 0.06, s = -0.02, e = 0.05, t = 0.05},
+	Punchy = {c = 0.14, s = 0.1, e = 0, t = -0.05}, Soft = {c = -0.04, s = -0.03, e = 0.08, t = 0.1}}
+local GRADE = {None = {c = 0, s = 0, t = {1, 1, 1}}, ["Warm Film"] = {c = 0.05, s = 0.05, t = {1, 0.96, 0.9}},
+	["Cool Steel"] = {c = 0.08, s = -0.05, t = {0.93, 0.98, 1.04}}, Bleach = {c = 0.2, s = -0.3, t = {1, 1, 1}}, Vivid = {c = 0.08, s = 0.18, t = {1, 1, 1}}}
+local function Resolve()
+	local P = {}
+	for k, v in pairs(S.era == "Custom" and CU or ERA[S.era]) do P[k] = v end
+	local se, td, wx = SEAS[S.season], TOD[S.tod], WX[S.weather]
+	P.tintR *= se.t[1]; P.tintG *= se.t[2]; P.tintB *= se.t[3]
+	P.sat += se.sat + td.sat + wx.sat
+	local tn, gr = TONE[S.tone] or TONE.Neutral, GRADE[S.grade] or GRADE.None
+	P.contrast += tn.c + gr.c; P.sat += tn.s + gr.s; P.exposure += tn.e; P.bthr += tn.t
+	P.tintR *= gr.t[1]; P.tintG *= gr.t[2]; P.tintB *= gr.t[3]
+	P.exposure += td.exp + wx.exp
+	P.bloom *= td.bloom; P.fog *= td.fog * wx.fog; P.haze += wx.haze; P.glare *= wx.glare; P.rays *= wx.rays
+	P.contrast += wx.con; P.spec += wx.spec; P.wtF += wx.wet
+	P.tintR += (td.warm + wx.warm) * 0.05 - wx.cool * 0.03
+	P.tintB += -(td.warm + wx.warm) * 0.07 + wx.cool * 0.03
+	for _, s in ipairs({"R", "G", "B"}) do
+		P["amb" .. s] *= td.amb * wx.amb
+		P["sun" .. s] *= td.sun * wx.sun
+	end
+	if td.clock then P.clock = td.clock end
+	local I = U.intensity
+	for k, nv in pairs(N0) do if P[k] then P[k] = nv + (P[k] - nv) * I end end
+	P.exposure += U.exposure; P.contrast += U.contrast; P.sat += U.sat
+	P.bloom *= U.bloom; P.haze *= U.haze; P.glare *= U.glare; P.shadow *= U.shadow; P.rays *= U.rays; P.spec += U.spec
+	P.tintR += U.warmth * 0.05; P.tintB -= U.warmth * 0.07
+	for k, v in pairs(P) do
+		if k ~= "clock" then local r = RG[k] or {0, 1}; P[k] = math.clamp(v, r[1], r[2]) end
+	end
+	return P
+end
+
+---------------------------------------------------------------- overlay (vignette)
+local function guiParent()
+	if gethui then local ok, h = pcall(gethui); if ok and h then return h end end
+	local ok = pcall(function() return game:GetService("CoreGui").Name end)
+	if ok then return game:GetService("CoreGui") end
+	return Players.LocalPlayer:WaitForChild("PlayerGui")
+end
+local ORD = 0
+local function N(cls, props, par)
+	local o = Instance.new(cls)
+	for k, v in pairs(props) do o[k] = v end
+	if o:IsA("GuiObject") and props.LayoutOrder == nil then ORD += 1; o.LayoutOrder = ORD end
+	if par then o.Parent = par end
+	return o
+end
+local ov = N("ScreenGui", {Name="TERA_Overlay", ResetOnSpawn=false, IgnoreGuiInset=true, DisplayOrder=5, ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+local vigG = {}
+for _, d in ipairs({{UDim2.new(1,0,0.3,0), UDim2.new(0,0,0,0), 90}, {UDim2.new(1,0,0.3,0), UDim2.new(0,0,0.7,0), 270},
+	{UDim2.new(0.25,0,1,0), UDim2.new(0,0,0,0), 0}, {UDim2.new(0.25,0,1,0), UDim2.new(0.75,0,0,0), 180}}) do
+	local f = N("Frame", {Size=d[1], Position=d[2], BackgroundColor3=Color3.new(0,0,0), BorderSizePixel=0, Visible=false}, ov)
+	vigG[#vigG + 1] = N("UIGradient", {Rotation=d[3]}, f)
+end
+local barT = N("Frame", {Size=UDim2.new(1,0,0,0), BackgroundColor3=Color3.new(0,0,0), BorderSizePixel=0}, ov)
+local barB = N("Frame", {Size=UDim2.new(1,0,0,0), AnchorPoint=Vector2.new(0,1), Position=UDim2.new(0,0,1,0), BackgroundColor3=Color3.new(0,0,0), BorderSizePixel=0}, ov)
+pcall(function() if syn and syn.protect_gui then syn.protect_gui(ov) end end)
+ov.Parent = guiParent()
+
+---------------------------------------------------------------- v4 systems: sky, clouds, lights, gloss, camera
+local dyn = {exp = 0, bloom = 1, rays = 1, glare = 1, uw = 0, focus = 60, radius = 54}
+local X = {extra = {}}
+do
+	local lp = Players.LocalPlayer
+	local extra = X.extra
+	local blur = mk("BlurEffect", "MBlur", {Enabled = false, Size = 0}); extra[#extra + 1] = blur
+	local sky = Lighting:FindFirstChildOfClass("Sky")
+	local origSky = sky and {sky.SunAngularSize, sky.MoonAngularSize, sky.StarCount, sky.CelestialBodiesShown}
+	if not sky then sky = mk("Sky", "Sky"); extra[#extra + 1] = sky end
+	local clouds = terrain and terrain:FindFirstChildOfClass("Clouds")
+	local origCl = clouds and {clouds.Enabled, clouds.Cover, clouds.Density, clouds.Color}
+	if terrain and not clouds then
+		clouds = Instance.new("Clouds"); clouds.Name = "TERA_Clouds"; clouds.Enabled = false; clouds.Parent = terrain
+		extra[#extra + 1] = clouds
+	end
+	local owx = {}
+	if terrain then
+		for k, p in pairs({ws = "WaterWaveSize", wv = "WaterWaveSpeed", g = "GrassLength"}) do
+			local ok, v = pcall(function() return terrain[p] end)
+			if ok then owx[k] = v end
+		end
+	end
+
+	-- sky / water / ambient extras (called from ApplyVals)
+	X.apply = function()
+		if has.EnvironmentDiffuseScale then Lighting.EnvironmentDiffuseScale = S.skyAmb end
+		if has.GeographicLatitude then Lighting.GeographicLatitude = S.lat end
+		sky.SunAngularSize, sky.MoonAngularSize, sky.StarCount, sky.CelestialBodiesShown = S.sunSize, S.moonSize, S.stars, S.bodies
+		if clouds then clouds.Enabled, clouds.Cover, clouds.Density = S.engClouds, S.engCover, S.engDens end
+		if terrain then
+			if owx.ws ~= nil then terrain.WaterWaveSize = S.water and S.waveSize or owx.ws end
+			if owx.wv ~= nil then terrain.WaterWaveSpeed = S.water and S.waveSpd or owx.wv end
+			if owx.g ~= nil then terrain.GrassLength = S.lush and S.grass or owx.g end
+		end
+	end
+	X.restore = function()
+		if origSky then sky.SunAngularSize, sky.MoonAngularSize, sky.StarCount, sky.CelestialBodiesShown = origSky[1], origSky[2], origSky[3], origSky[4]
+		else sky.SunAngularSize, sky.MoonAngularSize, sky.StarCount, sky.CelestialBodiesShown = 21, 11, 3000, true end
+		if clouds then
+			if origCl then clouds.Enabled, clouds.Cover, clouds.Density, clouds.Color = origCl[1], origCl[2], origCl[3], origCl[4]
+			else clouds.Enabled = false end
+		end
+		if terrain then
+			if owx.ws ~= nil then terrain.WaterWaveSize = owx.ws end
+			if owx.wv ~= nil then terrain.WaterWaveSpeed = owx.wv end
+			if owx.g ~= nil then terrain.GrassLength = owx.g end
+		end
+		blur.Enabled, blur.Size = false, 0
+		dyn.exp, dyn.bloom, dyn.rays, dyn.glare, dyn.uw = 0, 1, 1, 1, 0
+	end
+
+	-- 3D cumulus cloud field: clusters of overlapping spheres, sun-lit colour, wind drift, wrap-around, one BulkMoveTo at 10 Hz
+	local R = 1600
+	local CS = {Cumulus = {w = 1, h = 1, dark = 0}, Stratus = {w = 1.7, h = 0.4, dark = 0.05}, Storm = {w = 1.3, h = 1.4, dark = 0.4}}
+	X.CS = CS
+	local cfold = Instance.new("Folder"); cfold.Name = "TERA_Clouds3D"; cfold.Parent = cam; extra[#extra + 1] = cfold
+	local CL, CP, CF = {}, {}, {}
+	local cloudBase, needBuild, buildAt = 0, false, 0
+	local rng = Random.new(os.time())
+	local LIGHTC, DARKC, STORMC = Color3.fromRGB(246, 247, 250), Color3.fromRGB(168, 176, 194), Color3.fromRGB(72, 70, 78)
+	local WARMC, NIGHTC = Color3.fromRGB(255, 190, 140), Color3.fromRGB(58, 66, 96)
+	local function sunTone()
+		local sy = Lighting:GetSunDirection().Y
+		return (sy > -0.12) and math.clamp(1 - sy / 0.45, 0, 1) or 0, math.clamp(-sy * 4, 0, 1)
+	end
+	local function cloudLook()
+		local warm, night = sunTone()
+		if clouds and S.enabled then
+			clouds.Color = Color3.new(1, 1, 1):Lerp(WARMC, warm * 0.5):Lerp(Color3.fromRGB(70, 76, 100), night * 0.7)
+		end
+		if #CP == 0 then return end
+		local st = CS[S.cloudStyle] or CS.Cumulus
+		for _, c in ipairs(CL) do
+			for _, p in ipairs(c.puffs) do
+				p.part.Color = DARKC:Lerp(LIGHTC, p.shade):Lerp(STORMC, st.dark):Lerp(WARMC, warm * 0.55):Lerp(NIGHTC, night * 0.6)
+				p.part.Transparency = math.clamp(S.cloudSoft + p.edge * 0.3, 0, 0.95)
+			end
+		end
+	end
+	local function clearClouds() cfold:ClearAllChildren(); table.clear(CL); table.clear(CP); table.clear(CF) end
+	local function stepClouds(dt)
+		if #CL == 0 then return end
+		local cp = cam.CFrame.Position
+		local wd = math.rad(S.windDir)
+		local vx, vz = math.cos(wd) * S.windSpd, math.sin(wd) * S.windSpd
+		local y0, k = cloudBase + S.cloudAlt, 0
+		for _, c in ipairs(CL) do
+			c.x += vx * dt; c.z += vz * dt
+			local dx, dz = c.x - cp.X, c.z - cp.Z
+			if dx > R then c.x -= 2 * R elseif dx < -R then c.x += 2 * R end
+			if dz > R then c.z -= 2 * R elseif dz < -R then c.z += 2 * R end
+			for _, p in ipairs(c.puffs) do
+				k += 1
+				CF[k] = CFrame.new(c.x + p.ox, y0 + c.yo + p.oy, c.z + p.oz)
+			end
+		end
+		if not pcall(workspace.BulkMoveTo, workspace, CP, CF, Enum.BulkMoveMode.FireCFrameChanged) then
+			for i = 1, k do CP[i].CFrame = CF[i] end
+		end
+	end
+	local function buildClouds()
+		clearClouds()
+		local n = (S.enabled and S.cloudsOn) and math.floor(Qe().cl * S.cloudCover) or 0
+		if n < 1 then return end
+		local cp = cam.CFrame.Position
+		cloudBase = cp.Y
+		local st = CS[S.cloudStyle] or CS.Cumulus
+		for i = 1, n do
+			local c = {x = cp.X + rng:NextNumber(-R, R), z = cp.Z + rng:NextNumber(-R, R), yo = rng:NextNumber(-30, 60), puffs = {}}
+			local base = rng:NextNumber(110, 190) * S.cloudScale * st.w
+			for j = 1, rng:NextInteger(6, 10) do
+				local ang, rad = rng:NextNumber(0, 6.283), rng:NextNumber(0, base * 1.1)
+				local k = 1 - rad / (base * 1.3) -- 1 at the centre of the cloud, 0 at the rim
+				local sz = rng:NextNumber(0.55, 1) * base * (0.45 + k * 0.7)
+				local part = Instance.new("Part")
+				part.Shape, part.Size, part.Material = Enum.PartType.Ball, Vector3.new(sz, sz, sz), Enum.Material.SmoothPlastic
+				part.Anchored, part.CanCollide, part.CanQuery, part.CanTouch, part.CastShadow = true, false, false, false, false
+				part.Parent = cfold
+				c.puffs[#c.puffs + 1] = {part = part, ox = math.cos(ang) * rad, oz = math.sin(ang) * rad * 0.7,
+					oy = k * base * 0.32 * st.h + rng:NextNumber(-8, 8), shade = math.clamp(0.25 + k * 0.75, 0, 1), edge = 1 - k}
+				CP[#CP + 1] = part
+			end
+			CL[#CL + 1] = c
+		end
+		cloudLook(); stepClouds(0)
+	end
+	X.buildClouds, X.clearClouds, X.cloudLook = buildClouds, clearClouds, cloudLook
+	X.schedBuild = function() needBuild = true; buildAt = os.clock() + 0.5 end
+
+	-- light manager: real shadows on the nearest lights + warm lantern tint/boost at night (originals restored)
+	local lights, lightO = setmetatable({}, {__mode = "k"}), setmetatable({}, {__mode = "k"})
+	local lscanned
+	local WARM = Color3.fromRGB(255, 176, 100)
+	local function trackLight(l) if l:IsA("PointLight") or l:IsA("SpotLight") or l:IsA("SurfaceLight") then lights[l] = true end end
+	local function startLights()
+		if lscanned then return end
+		lscanned = true
+		conn(workspace.DescendantAdded:Connect(trackLight))
+		task.spawn(function()
+			local n = 0
+			for _, d in ipairs(workspace:GetDescendants()) do
+				trackLight(d); n += 1
+				if n % 800 == 0 then task.wait() end
+			end
+		end)
+	end
+	local function lightPos(l)
+		local p = l.Parent
+		if p then
+			if p:IsA("BasePart") then return p.Position elseif p:IsA("Attachment") then return p.WorldPosition end
+		end
+	end
+	local function restoreLights()
+		for l, o in pairs(lightO) do pcall(function() l.Shadows, l.Color, l.Brightness = o[1], o[2], o[3] end) end
+		table.clear(lightO)
+	end
+	local function stepLights()
+		local Q = Qe()
+		local active = S.enabled and ((S.lightSh and Q.lights > 0) or S.lantWarm > 0 or S.lantBoost > 1)
+		if not active then if next(lightO) then restoreLights() end return end
+		startLights()
+		local cp = cam.CFrame.Position
+		local near, inNear = {}, {}
+		local k = math.clamp((0.2 - Lighting:GetSunDirection().Y) / 0.3, 0, 1) -- 0 by day, 1 at night
+		for l in pairs(lights) do
+			local pos = l.Parent and l.Enabled and lightPos(l)
+			if pos then
+				local d = (pos - cp).Magnitude
+				if d < 220 then near[#near + 1] = {l, d} end
+			end
+		end
+		table.sort(near, function(a, b) return a[2] < b[2] end)
+		local shadowN = S.lightSh and math.min(Q.lights, S.maxLights) or 0
+		for i, e in ipairs(near) do
+			local l = e[1]
+			inNear[l] = true
+			local o = lightO[l]
+			if not o then o = {l.Shadows, l.Color, l.Brightness}; lightO[l] = o end
+			l.Shadows = (i <= shadowN) or o[1]
+			l.Color = o[2]:Lerp(WARM, S.lantWarm * k)
+			l.Brightness = o[3] * (1 + (S.lantBoost - 1) * k)
+		end
+		for l, o in pairs(lightO) do
+			if not inNear[l] then pcall(function() l.Shadows, l.Color, l.Brightness = o[1], o[2], o[3] end); lightO[l] = nil end
+		end
+	end
+	X.stepLights, X.restoreLights = stepLights, restoreLights
+
+	-- glossy surfaces: raises Reflectance on stone-like materials (originals stored, restored on off)
+	local GLM, GLX = {}, {}
+	for _, m in ipairs({"Concrete", "Cobblestone", "Pavement", "Asphalt", "Slate", "Marble", "Granite", "Brick", "Basalt", "Limestone", "Sandstone"}) do
+		local ok, e = pcall(function() return Enum.Material[m] end)
+		if ok and e then GLM[e] = true end
+	end
+	for _, m in ipairs({"Glass", "Metal", "DiamondPlate", "CorrodedMetal", "Foil"}) do
+		local ok, e = pcall(function() return Enum.Material[m] end)
+		if ok and e then GLX[e] = true end
+	end
+	local glossO, gconn, gGen = setmetatable({}, {__mode = "k"}), nil, 0
+	local function gTarget(p)
+		local a = S.glossAmt + ((S.weather == "Rain") and 0.08 or 0)
+		return GLX[p.Material] and math.min(a * 1.8, 0.6) or a
+	end
+	local function glossPart(p)
+		if p:IsA("BasePart") and not p:IsA("Terrain") and (GLM[p.Material] or GLX[p.Material]) then
+			if glossO[p] == nil then glossO[p] = p.Reflectance end
+			p.Reflectance = math.max(glossO[p], gTarget(p))
+		end
+	end
+	local function glossOff()
+		gGen += 1
+		if gconn then gconn:Disconnect(); gconn = nil end
+		for p, o in pairs(glossO) do pcall(function() p.Reflectance = o end) end
+		table.clear(glossO)
+	end
+	local function glossOn()
+		glossOff()
+		if not (S.enabled and S.gloss and Qe().gloss) then return end
+		local gen = gGen
+		gconn = workspace.DescendantAdded:Connect(function(d) task.defer(glossPart, d) end)
+		task.spawn(function()
+			local n = 0
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if gen ~= gGen then return end
+				glossPart(d); n += 1
+				if n % 500 == 0 then task.wait() end
+			end
+		end)
+	end
+	X.glossOn, X.glossOff = glossOn, glossOff
+	X.glossUpdate = function() for p, o in pairs(glossO) do p.Reflectance = math.max(o, gTarget(p)) end end
+
+	-- camera: movement (head bob, lean, landing, speed FOV, zoom, orbit) + motion blur + breathing; one render-step bind only while needed
+	local camBound, lastLook = false, Vector3.new(0, 0, 1)
+	local fovBase, fovSet, fovD, zoomT, zoomCur = nil, nil, 0, 0, 0
+	local phase, tiltCur, landOff, wasAir, lastVy, orbA, prevType = 0, 0, 0, false, 0, 0, nil
+	local function camNeeded()
+		return S.enabled and (S.mblur or S.sway or S.bob or S.tilt or S.landing or S.speedFov or S.orbit or zoomT > 0 or zoomCur > 0.001)
+	end
+	local function camStep(dt)
+		cam = workspace.CurrentCamera
+		local cf0 = cam.CFrame
+		local look = cf0.LookVector
+		if S.mblur and Qe().mb then
+			local ang = math.acos(math.clamp(look:Dot(lastLook), -1, 1)) / math.max(dt, 1e-3)
+			blur.Size += (math.clamp(ang * 1.2, 0, 8) - blur.Size) * math.min(dt * 10, 1)
+		elseif blur.Size > 0 then blur.Size = 0 end
+		lastLook = look
+		local ch = lp.Character
+		local root = ch and ch:FindFirstChild("HumanoidRootPart")
+		local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+		local vel = root and root.AssemblyLinearVelocity or Vector3.zero
+		local hv = Vector3.new(vel.X, 0, vel.Z)
+		local speed = hv.Magnitude
+		local air = (hum and hum.FloorMaterial == Enum.Material.Air) or false
+		if S.orbit and root then -- cinematic orbit around the character
+			if cam.CameraType ~= Enum.CameraType.Scriptable then prevType = prevType or cam.CameraType; cam.CameraType = Enum.CameraType.Scriptable end
+			orbA += dt * S.orbitSpd
+			local c = root.Position + Vector3.new(0, 1.5, 0)
+			cam.CFrame = CFrame.lookAt(c + Vector3.new(math.cos(orbA) * S.orbitDist, 3.5, math.sin(orbA) * S.orbitDist), c)
+		else
+			if prevType then cam.CameraType = prevType; prevType = nil end
+			if cam.CameraType == Enum.CameraType.Custom then
+				local off = CFrame.identity
+				if S.bob and root and not air then
+					phase += dt * speed * 0.6
+					local a = math.clamp(speed / 16, 0, 1.3) * S.bobAmt
+					off *= CFrame.new(math.cos(phase) * 0.05 * a, math.abs(math.sin(phase)) * 0.09 * a - 0.04 * a, 0) * CFrame.Angles(0, 0, math.cos(phase) * 0.004 * a)
+				end
+				if S.tilt and root then
+					tiltCur += (-hv:Dot(cf0.RightVector) / 16 * 0.035 * S.tiltAmt - tiltCur) * math.min(dt * 6, 1)
+					off *= CFrame.Angles(0, 0, tiltCur)
+				end
+				if S.landing and hum then
+					if wasAir and not air and lastVy < -22 then landOff = -math.clamp(-lastVy / 70, 0.25, 1) * 0.7 end
+					landOff += (0 - landOff) * math.min(dt * 7, 1)
+					off *= CFrame.new(0, landOff, 0)
+				end
+				if S.sway then
+					local t = os.clock()
+					off *= CFrame.Angles(math.sin(t * 0.7) * 0.0025, math.cos(t * 0.5) * 0.0025, math.sin(t * 0.4) * 0.0015)
+				end
+				cam.CFrame = cf0 * off
+			end
+		end
+		wasAir, lastVy = air, vel.Y
+		if S.speedFov or zoomT > 0 or zoomCur > 0.001 then -- FOV: speed kick + hold-to-zoom, never fights the game's own FOV changes
+			if fovSet == nil or math.abs(cam.FieldOfView - fovSet) > 1e-3 then fovBase = cam.FieldOfView end
+			fovD += ((S.speedFov and math.clamp((speed - 8) / 24, 0, 1) * 9 or 0) - fovD) * math.min(dt * 5, 1)
+			zoomCur += (zoomT - zoomCur) * math.min(dt * 8, 1)
+			local f = fovBase + fovD
+			fovSet = math.clamp(f + (S.zoomFov - f) * zoomCur, 5, 120)
+			cam.FieldOfView = fovSet
+		elseif fovSet then cam.FieldOfView = fovBase; fovSet = nil; fovD = 0 end
+		if not camNeeded() then X.syncCam() end
+	end
+	X.syncCam = function()
+		local need = camNeeded()
+		if need and not camBound then
+			RS:BindToRenderStep("TERA_Cam", Enum.RenderPriority.Camera.Value + 1, camStep); camBound = true
+		elseif not need and camBound then
+			pcall(function() RS:UnbindFromRenderStep("TERA_Cam") end); camBound = false; blur.Size = 0
+			if fovSet then cam.FieldOfView = fovBase; fovSet = nil; fovD = 0 end
+			if prevType then cam.CameraType = prevType; prevType = nil end
+		end
+		blur.Enabled = S.enabled and S.mblur and true or false
+	end
+	X.zoom = function(on) zoomT = on and 1 or 0; X.syncCam() end
+	X.Bars = function()
+		local sz = UDim2.new(1, 0, (S.enabled and S.bars) and 0.11 or 0, 0)
+		TS:Create(barT, TweenInfo.new(0.5, Enum.EasingStyle.Quad), {Size = sz}):Play()
+		TS:Create(barB, TweenInfo.new(0.5, Enum.EasingStyle.Quad), {Size = sz}):Play()
+	end
+
+	-- dynamic camera-aware effects: sun-facing glare, indoor eye adaptation, auto-focus, underwater look
+	local tgt = {exp = 0, bloom = 1, rays = 1, glare = 1, uw = 0, focus = 60, radius = 54}
+	local rp = RaycastParams.new(); rp.FilterType = Enum.RaycastFilterType.Exclude; rp.IgnoreWater = true
+	local function underwater(cp)
+		if not terrain then return false end
+		local ok, res = pcall(function()
+			local cell = terrain:WorldToCell(cp)
+			local c = terrain:CellCenterToWorld(cell.X, cell.Y, cell.Z)
+			local m = terrain:ReadVoxels(Region3.new(c - Vector3.new(2, 2, 2), c + Vector3.new(2, 2, 2)), 4)
+			return m[1][1][1] == Enum.Material.Water
+		end)
+		return ok and res
+	end
+	X.tick5 = function() -- 5 Hz: sample the scene
+		X.rp = rp
+		cam = workspace.CurrentCamera
+		local cf = cam.CFrame
+		local cp = cf.Position
+		local ch = lp.Character
+		rp.FilterDescendantsInstances = ch and {ch} or {}
+		local sd = Lighting:GetSunDirection()
+		local roof = workspace:Raycast(cp, Vector3.new(0, 90, 0), rp) ~= nil
+		local indoor = S.eyeAdapt and roof
+		X.indoor = roof
+		local vis = 0
+		if sd.Y > 0.02 and not indoor then vis = X.sampleSun(cp, sd) end -- 0..1 share of the sun disc that is unblocked
+		X.vis = vis
+		local f = S.sunGlare and (math.max(0, cf.LookVector:Dot(sd)) ^ 5 * vis) or 0
+		tgt.bloom, tgt.rays, tgt.glare = 1 + f * 0.9, 1 + f * 1.4, 1 + f * 1.6
+		tgt.exp = S.autoExp and -0.3 * f or 0 -- pull exposure down when staring at the sun
+		if indoor then tgt.exp, tgt.rays, tgt.glare = 0.3, 0.2, 0.4 end
+		tgt.uw = (S.uw and underwater(cp)) and 1 or 0
+		if S.autoFocus and Qe().af then
+			local hit = workspace:Raycast(cp, cf.LookVector * 500, rp)
+			local d = hit and (hit.Position - cp).Magnitude or 500
+			tgt.focus, tgt.radius = d, math.max(12, d * 0.35)
+		else
+			tgt.focus, tgt.radius = S.focusDist, S.focusDist * 0.9
+		end
+	end
+	X.tick10 = function(dt) -- 10 Hz: clouds, day cycle, ease dynamic values
+		if S.cycle > 0 then Lighting.ClockTime = (Lighting.ClockTime + dt * S.cycle) % 24 end
+		if needBuild and os.clock() >= buildAt then needBuild = false; buildClouds() end
+		stepClouds(dt)
+		local moved = false
+		for k, v in pairs(tgt) do
+			local d = v - dyn[k]
+			if math.abs(d) > (k == "focus" and 0.3 or 0.003) then dyn[k] += d * 0.3; moved = true end
+		end
+		if moved and X.reapply then X.reapply() end
+	end
+	X.tick2 = function() cloudLook(); stepLights() end -- 0.5 Hz: cloud colours, lights
+end
+
+---------------------------------------------------------------- v5: lens flare, sun occlusion, contact shadows
+do
+	local lp = Players.LocalPlayer
+	local JIT = {{0, 0}, {0.05, 0}, {-0.05, 0}, {0, 0.05}, {0, -0.05}}
+	X.sampleSun = function(cp, sd) -- fraction of the sun disc not blocked by solid geometry (partial = trees)
+		local right = sd:Cross(Vector3.yAxis)
+		if right.Magnitude < 1e-3 then right = Vector3.xAxis end
+		right = right.Unit
+		local up = right:Cross(sd).Unit
+		local open = 0
+		for _, o in ipairs(JIT) do
+			local hit = workspace:Raycast(cp, (sd + right * o[1] + up * o[2]).Unit * 500, X.rp)
+			if not hit or (not hit.Instance:IsA("Terrain") and hit.Instance.Transparency >= 0.8) then open += 1 end
+		end
+		return open / #JIT
+	end
+
+	-- screen-space lens flare built from GUI shapes (no external assets)
+	local fl = N("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, ZIndex = 2}, ov)
+	local EL = {}
+	local function disc(kind, size, col, tr, ring, t)
+		local f = Instance.new("Frame")
+		f.AnchorPoint, f.Size, f.BorderSizePixel, f.BackgroundColor3 = Vector2.new(0.5, 0.5), UDim2.fromOffset(size, size), 0, col
+		f.BackgroundTransparency = ring and 1 or tr
+		local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0.5, 0); c.Parent = f
+		local st
+		if ring then st = Instance.new("UIStroke"); st.Color, st.Thickness, st.Transparency = col, ring, tr; st.Parent = f end
+		f.Parent = fl
+		EL[#EL + 1] = {kind = kind, f = f, st = st, tr = tr, size = size, t = t}
+	end
+	local function streak(w, h, rot, col, tr)
+		local f = Instance.new("Frame")
+		f.AnchorPoint, f.BorderSizePixel, f.BackgroundColor3, f.BackgroundTransparency, f.Rotation = Vector2.new(0.5, 0.5), 0, col, tr, rot
+		local g = Instance.new("UIGradient")
+		g.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0), NumberSequenceKeypoint.new(1, 1)})
+		g.Parent = f
+		f.Parent = fl
+		EL[#EL + 1] = {kind = "streak", f = f, tr = tr, w = w, h = h}
+	end
+	local WARMW = Color3.fromRGB(255, 244, 225)
+	for i, d in ipairs({{60, 0.78}, {140, 0.88}, {300, 0.94}, {640, 0.97}}) do disc("core", d[1], WARMW, d[2]) end
+	disc("halo", 100, Color3.fromRGB(255, 235, 210), 0.9, 3)
+	disc("ghost", 70, Color3.fromRGB(120, 200, 255), 0.88, nil, 0.35)
+	disc("ghost", 40, Color3.fromRGB(255, 170, 90), 0.8, 2, 0.55)
+	disc("ghost", 110, Color3.fromRGB(160, 255, 190), 0.86, 3, 0.8)
+	disc("ghost", 60, Color3.fromRGB(255, 120, 160), 0.9, nil, 1.2)
+	disc("ghost", 150, Color3.fromRGB(150, 170, 255), 0.88, 2, 1.6)
+	disc("ghost", 90, Color3.fromRGB(255, 210, 140), 0.9, nil, 2.1)
+	streak(0.9, 4, 0, Color3.fromRGB(190, 215, 255), 0.55)
+	streak(0.5, 2, 32, Color3.fromRGB(255, 225, 190), 0.75)
+	streak(0.5, 2, -32, Color3.fromRGB(255, 225, 190), 0.75)
+
+	local vis, lastLook = 0, Vector3.new(0, 0, 1)
+	local function flareStep(dt)
+		local Q = Qe()
+		local sd = Lighting:GetSunDirection()
+		local cf = cam.CFrame
+		local dotv = cf.LookVector:Dot(sd)
+		if not (S.flare and S.enabled and Q.fl) or sd.Y < -0.04 or dotv < 0.1 then fl.Visible = false; lastLook = cf.LookVector return end
+		local vp = cam.ViewportSize
+		local p = cam:WorldToViewportPoint(cf.Position + sd * 1000)
+		local pos, c = Vector2.new(p.X, p.Y), vp / 2
+		vis += ((X.vis or 0) - vis) * math.min(dt * 6, 1)
+		local ang = math.acos(math.clamp(cf.LookVector:Dot(lastLook), -1, 1)) / math.max(dt, 1e-3)
+		lastLook = cf.LookVector
+		local edge = 1 - math.clamp((pos - c).Magnitude / (vp.Magnitude * 0.6), 0, 1)
+		local I = S.flareAmt * vis * edge * (math.clamp((dotv - 0.1) / 0.5, 0, 1) ^ 1.5) * (1 + math.min(ang * 0.12, 0.5)) * math.clamp((sd.Y + 0.04) / 0.1, 0, 1)
+		if I < 0.01 then fl.Visible = false return end
+		fl.Visible = true
+		local u, v = vp.Y / 720, c - pos
+		for _, e in ipairs(EL) do
+			local k, f = e.kind, e.f
+			if k == "core" then
+				f.Position, f.Size = UDim2.fromOffset(pos.X, pos.Y), UDim2.fromOffset(e.size * u, e.size * u)
+			elseif k == "ghost" then
+				local a = pos + v * e.t
+				f.Position, f.Size = UDim2.fromOffset(a.X, a.Y), UDim2.fromOffset(e.size * u, e.size * u)
+			elseif k == "halo" then
+				local d = v.Magnitude * 1.1 + 0.25 * vp.Y
+				f.Position, f.Size = UDim2.fromOffset(c.X, c.Y), UDim2.fromOffset(d, d)
+			else
+				f.Position, f.Size = UDim2.fromOffset(pos.X, pos.Y), UDim2.fromOffset(vp.X * e.w, e.h * u)
+			end
+			local t = math.clamp(1 - (1 - e.tr) * math.min(I, 1.5), 0, 1)
+			if e.st then e.st.Transparency = t else f.BackgroundTransparency = t end
+		end
+	end
+
+	-- contact shadow: soft stacked discs under the character that fade as you leave the ground
+	local sfold = Instance.new("Folder"); sfold.Name = "TERA_Contact"; sfold.Parent = cam; X.extra[#X.extra + 1] = sfold
+	local CS3, CT = {}, {0.92, 0.85, 0.74}
+	for i, d in ipairs({4.4, 3.2, 2.1}) do
+		local p = Instance.new("Part")
+		p.Shape, p.Size, p.Anchored, p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = Enum.PartType.Cylinder, Vector3.new(0.05, d, d), true, false, false, false, false
+		p.Material, p.Color, p.Transparency = Enum.Material.SmoothPlastic, Color3.new(0, 0, 0), 1
+		p.Parent = sfold
+		CS3[i] = p
+	end
+	local function hideContact() for _, p in ipairs(CS3) do p.Transparency = 1 end end
+	local function contactStep()
+		local ch = lp.Character
+		local root = ch and ch:FindFirstChild("HumanoidRootPart")
+		if not (S.contact and S.enabled and Qe().cs and root and X.rp) then hideContact() return end
+		local hit = workspace:Raycast(root.Position, Vector3.new(0, -12, 0), X.rp)
+		if not hit then hideContact() return end
+		local fade = math.clamp((root.Position.Y - hit.Position.Y - 3) / 7, 0, 1)
+		local n = hit.Normal
+		local vy = n:Cross(Vector3.xAxis)
+		if vy.Magnitude < 0.1 then vy = n:Cross(Vector3.zAxis) end
+		local base = CFrame.fromMatrix(hit.Position + n * 0.03, n, vy.Unit)
+		local day = math.clamp(Lighting:GetSunDirection().Y * 4 + 0.5, 0.25, 1)
+		for i, p in ipairs(CS3) do
+			p.CFrame = base + n * (0.006 * i)
+			p.Transparency = math.clamp(1 - (1 - CT[i]) * (1 - fade) * day, 0, 1)
+		end
+	end
+
+	local fxBound = false
+	X.syncFx = function()
+		local need = S.enabled and (S.flare or S.contact)
+		if need and not fxBound then
+			RS:BindToRenderStep("TERA_Fx", Enum.RenderPriority.Camera.Value + 2, function(dt) cam = workspace.CurrentCamera; flareStep(dt); contactStep() end)
+			fxBound = true
+		elseif not need and fxBound then
+			pcall(function() RS:UnbindFromRenderStep("TERA_Fx") end); fxBound = false
+			fl.Visible = false; hideContact()
+		end
+	end
+end
+
+---------------------------------------------------------------- v8: weather particles + lens raindrops
+do
+	local pfold = Instance.new("Folder"); pfold.Name = "TERA_Particles"; pfold.Parent = cam; X.extra[#X.extra + 1] = pfold
+	local PT = {
+		Rain = {n = 170, size = Vector3.new(0.05, 0.05, 3.4), col = Color3.fromRGB(196, 210, 230), tr = 0.55, shape = Enum.PartType.Block, mat = Enum.Material.SmoothPlastic, box = 80},
+		Snow = {n = 150, size = Vector3.new(0.4, 0.4, 0.4), col = Color3.fromRGB(246, 249, 255), tr = 0.12, shape = Enum.PartType.Ball, mat = Enum.Material.SmoothPlastic, box = 70},
+		Dust = {n = 70, size = Vector3.new(0.14, 0.14, 0.14), col = Color3.fromRGB(255, 238, 205), tr = 0.55, shape = Enum.PartType.Ball, mat = Enum.Material.Neon, box = 34},
+		Fireflies = {n = 34, size = Vector3.new(0.22, 0.22, 0.22), col = Color3.fromRGB(190, 255, 120), tr = 0.1, shape = Enum.PartType.Ball, mat = Enum.Material.Neon, box = 40},
+	}
+	X.PT = PT
+	local rng = Random.new(os.time() + 7)
+	local pool, parts, cfs, cfg, hb = {}, {}, {}, nil, nil
+	local acc, tclock, parked, lastT = 0, 0, false, -1
+
+	local LD = N("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 3}, ov)
+	local drops = {}
+	for i = 1, 12 do
+		local f = Instance.new("Frame")
+		f.AnchorPoint, f.BorderSizePixel, f.BackgroundColor3, f.BackgroundTransparency, f.Visible = Vector2.new(0.5, 0.5), 0, Color3.new(1, 1, 1), 0.9, false
+		local cr = Instance.new("UICorner"); cr.CornerRadius = UDim.new(0.5, 0); cr.Parent = f
+		local st = Instance.new("UIStroke"); st.Color, st.Thickness, st.Transparency = Color3.new(1, 1, 1), 1.5, 0.5; st.Parent = f
+		f.Parent = LD
+		drops[i] = {f = f, st = st, born = 0, life = 1, x = 0, y = 0, on = false}
+	end
+	local function hideDrops() for _, e in ipairs(drops) do e.on = false; e.f.Visible = false end end
+	local function dropsStep(d, active, vp)
+		if active and rng:NextNumber() < d * 2.5 then
+			for _, e in ipairs(drops) do
+				if not e.on then
+					e.on, e.born, e.life = true, tclock, rng:NextNumber(2, 3.6)
+					e.x, e.y = rng:NextNumber(0.05, 0.95) * vp.X, rng:NextNumber(0.05, 0.9) * vp.Y
+					local sz = rng:NextNumber(10, 30)
+					e.f.Size = UDim2.fromOffset(sz, sz * 1.15)
+					e.f.Visible = true
+					break
+				end
+			end
+		end
+		for _, e in ipairs(drops) do
+			if e.on then
+				local a = (tclock - e.born) / e.life
+				if a >= 1 or not active then e.on = false; e.f.Visible = false
+				else
+					e.y += d * 14
+					e.f.Position = UDim2.fromOffset(e.x, e.y)
+					local fade = a < 0.15 and a / 0.15 or (1 - a)
+					e.f.BackgroundTransparency, e.st.Transparency = 1 - 0.1 * fade, 1 - 0.5 * fade
+				end
+			end
+		end
+	end
+
+	local function step(dt)
+		acc += dt
+		if acc < 1 / 30 then return end
+		local d = acc; acc = 0
+		tclock += d
+		local c = cfg
+		if not c then return end
+		local cf = workspace.CurrentCamera.CFrame
+		local cp = cf.Position
+		local half = c.box * 0.5
+		local name = S.particles
+		local roof = X.indoor and true or false
+		if roof ~= parked then
+			parked = roof; lastT = -1
+			for i = 1, #parts do parts[i].Transparency = roof and 1 or c.tr end
+		end
+		dropsStep(d, name == "Rain" and S.lensDrops and Qe().fl and not parked, workspace.CurrentCamera.ViewportSize)
+		if parked then return end
+		local sy = Lighting:GetSunDirection().Y
+		local wd = math.rad(S.windDir)
+		local wx, wz = math.cos(wd) * S.windSpd * 0.3, math.sin(wd) * S.windSpd * 0.3
+		for i, a in ipairs(pool) do
+			local pos = a.pos
+			if name == "Rain" then
+				local vel = Vector3.new(wx, -88, wz)
+				pos += vel * d
+				cfs[i] = CFrame.lookAt(pos, pos + vel)
+			elseif name == "Snow" then
+				pos += Vector3.new(wx * 0.5 + math.sin(tclock * 0.9 + a.ph) * 1.2, -7, wz * 0.5 + math.cos(tclock * 0.7 + a.ph) * 1.2) * d
+				cfs[i] = CFrame.new(pos)
+			else
+				local k = name == "Dust" and 0.5 or 1.4
+				pos += (Vector3.new(math.sin(tclock * 0.5 + a.ph), math.sin(tclock * 0.37 + a.ph * 1.7) * 0.5, math.cos(tclock * 0.43 + a.ph * 0.6)) * k
+					+ (name == "Dust" and Vector3.new(wx, 0, wz) * 0.15 or Vector3.zero)) * d
+				cfs[i] = CFrame.new(pos)
+			end
+			local rel = pos - cp
+			local rx, ry, rz = rel.X, rel.Y, rel.Z
+			if rx > half then rx -= 2 * half elseif rx < -half then rx += 2 * half end
+			if rz > half then rz -= 2 * half elseif rz < -half then rz += 2 * half end
+			if ry < -half * 0.8 then ry += half * 1.6 elseif ry > half * 0.8 then ry -= half * 1.6 end
+			if rx ~= rel.X or ry ~= rel.Y or rz ~= rel.Z then
+				pos = cp + Vector3.new(rx, ry, rz)
+				cfs[i] = cfs[i].Rotation + pos
+			end
+			a.pos = pos
+			if name == "Fireflies" then
+				local night = math.clamp(-sy * 4, 0, 1)
+				parts[i].Transparency = 1 - (1 - c.tr) * night * (0.5 + 0.5 * math.sin(tclock * 2.2 + a.ph * 3))
+			end
+		end
+		if name == "Dust" then -- motes only show in direct sun
+			local t = 1 - (1 - c.tr) * math.clamp(sy * 3, 0, 1)
+			if math.abs(t - lastT) > 0.02 then lastT = t; for i = 1, #parts do parts[i].Transparency = t end end
+		end
+		if not pcall(workspace.BulkMoveTo, workspace, parts, cfs, Enum.BulkMoveMode.FireCFrameChanged) then
+			for i = 1, #parts do parts[i].CFrame = cfs[i] end
+		end
+	end
+
+	local function clear()
+		if hb then hb:Disconnect(); hb = nil end
+		pfold:ClearAllChildren(); table.clear(pool); table.clear(parts); table.clear(cfs)
+		cfg, parked, lastT = nil, false, -1
+		hideDrops()
+	end
+	X.syncParts = function()
+		clear()
+		local c = PT[S.particles]
+		local n = (S.enabled and c) and math.floor(c.n * S.partAmt * Qe().pf) or 0
+		if n < 1 then return end
+		cfg = c
+		local cp = cam.CFrame.Position
+		local half = c.box * 0.5
+		for i = 1, n do
+			local part = Instance.new("Part")
+			part.Shape, part.Size, part.Material, part.Color, part.Transparency = c.shape, c.size, c.mat, c.col, c.tr
+			part.Anchored, part.CanCollide, part.CanQuery, part.CanTouch, part.CastShadow = true, false, false, false, false
+			part.Parent = pfold
+			parts[i] = part
+			local pos = cp + Vector3.new(rng:NextNumber(-half, half), rng:NextNumber(-half * 0.8, half * 0.8), rng:NextNumber(-half, half))
+			pool[i] = {pos = pos, ph = rng:NextNumber(0, 6.28)}
+			cfs[i] = CFrame.new(pos)
+		end
+		hb = RS.Heartbeat:Connect(step)
+	end
+	local tk = 0
+	X.schedParts = function() tk += 1; local my = tk; task.delay(0.4, function() if tk == my then X.syncParts() end end) end
+end
+
+---------------------------------------------------------------- apply values to the game
+local function ApplyVals(v)
+	local Q = Qe()
+	local uw = dyn.uw
+	local sy = Lighting:GetSunDirection().Y
+	local low = (sy > -0.15) and math.clamp(1 - sy / 0.5, 0, 1) or 0 -- 0 at noon, 1 at the horizon
+	local night = math.clamp(-sy * 5, 0, 1)
+	local tint = Color3.new(v.tintR, v.tintG, v.tintB)
+	local acol, dcol = Color3.new(v.atR, v.atG, v.atB), Color3.new(v.dcR, v.dcG, v.dcB)
+	if S.scatter then -- sun-angle atmospheric scattering: warm low sun, dark blue night
+		acol = acol:Lerp(Color3.new(1, 0.68, 0.48), low * 0.5):Lerp(Color3.new(0.1, 0.14, 0.26), night * 0.85)
+		dcol = dcol:Lerp(Color3.new(0.95, 0.45, 0.25), low * 0.65):Lerp(Color3.new(0.05, 0.07, 0.14), night)
+	end
+	local dens = v.fog * 0.7 * S.fogAmt
+	if S.dawnMist then dens = dens * (1 + 1.1 * math.exp(-((Lighting.ClockTime - 6.4) ^ 2) / 2.5)) end -- thicker mist around sunrise
+	dens = math.clamp(dens, 0, 0.75)
+	if uw > 0.01 then -- underwater look
+		tint = tint:Lerp(Color3.new(0.6, 0.88, 0.95), uw * 0.7)
+		dens, acol = dens + (0.6 - dens) * uw, acol:Lerp(Color3.new(0.1, 0.38, 0.45), uw)
+	end
+	cc.TintColor, cc.Saturation, cc.Contrast, cc.Brightness = tint, v.sat, v.contrast, 0
+	bloom.Intensity, bloom.Size, bloom.Threshold = v.bloom * dyn.bloom, v.bsize * Q.bs * 0.7, v.bthr
+	local wide = S.bloomWide and Q.bs >= 0.75 -- second, wide bloom = smooth HDR falloff
+	bloom2.Enabled = wide
+	if wide then bloom2.Intensity, bloom2.Size, bloom2.Threshold = v.bloom * 0.5 * dyn.bloom, 52 * Q.bs, v.bthr + 0.12 end
+	sun.Intensity = v.rays * Q.ray * dyn.rays * (1 - uw)
+	dof.Enabled, dof.FarIntensity, dof.NearIntensity = S.dof and Q.dof, S.dofAmt, S.autoFocus and 0.12 or 0
+	dof.FocusDistance, dof.InFocusRadius = dyn.focus, dyn.radius
+	if S.fogMode == "Classic" then
+		if atmo.Parent then atmo.Parent = nil end
+		Lighting.FogColor, Lighting.FogStart = acol, S.fogDist * 0.08
+		Lighting.FogEnd = math.max(120, S.fogDist / math.max(S.fogAmt, 0.3))
+	else
+		if atmo.Parent ~= Lighting then atmo.Parent = Lighting end
+		atmo.Density, atmo.Offset, atmo.Haze, atmo.Glare = dens, 0.12 + v.fog * 0.3, v.haze, v.glare * dyn.glare
+		atmo.Color, atmo.Decay = acol, dcol
+		Lighting.FogEnd = 1e5
+	end
+	local depth = S.shadowDepth -- deeper shadows = lower sky fill, stronger sun key, cool shade tint
+	local am = 1.25 - 0.55 * depth
+	local ar, ag, ab = v.ambR * am, v.ambG * am, v.ambB * am
+	Lighting.Brightness, Lighting.ExposureCompensation = v.brightness * (0.9 + 0.2 * depth), v.exposure + dyn.exp
+	Lighting.OutdoorAmbient, Lighting.Ambient = Color3.new(ar, ag, ab), Color3.new(ar * 0.8, ag * 0.8, ab * 0.8)
+	Lighting.ColorShift_Top = Color3.new(v.sunR + low * 0.10, v.sunG + low * 0.035, v.sunB)
+	local day = 1 - night
+	Lighting.ColorShift_Bottom = Color3.new(0.03 * depth * day, 0.05 * depth * day, 0.10 * depth * day)
+	Lighting.GlobalShadows = true
+	if has.ShadowSoftness then Lighting.ShadowSoftness = v.shadow * Q.sh end
+	if has.EnvironmentSpecularScale then Lighting.EnvironmentSpecularScale = v.spec end
+	if v.clock and S.cycle <= 0 then Lighting.ClockTime = v.clock end
+	if canTech and last.tech ~= Q.fut then
+		last.tech = Q.fut
+		pcall(sethiddenproperty, Lighting, "Technology", Q.fut and Enum.Technology.Future or origTech)
+	end
+	local mat = Q.mat and S.pbr
+	if origMat ~= nil and last.mat ~= mat then last.mat = mat; pcall(function() MS.Use2022Materials = mat end) end
+	if terrain then
+		if S.water then terrain.WaterColor, terrain.WaterTransparency, terrain.WaterReflectance = Color3.new(v.wtR, v.wtG, v.wtB), v.wtT, v.wtF
+		elseif ow then terrain.WaterColor, terrain.WaterTransparency, terrain.WaterReflectance = ow.c, ow.t, ow.r end
+	end
+	local vg = Q.vig and S.vig > 0
+	for _, g in ipairs(vigG) do g.Parent.Visible = vg end
+	if vg and last.vig ~= S.vig then
+		last.vig = S.vig
+		local ng = NumberSequence.new({NumberSequenceKeypoint.new(0, 1 - S.vig * 0.85), NumberSequenceKeypoint.new(1, 1)})
+		for _, g in ipairs(vigG) do g.Transparency = ng end
+	end
+	X.apply()
+end
+local function Reapply() if cur and S.enabled then ApplyVals(cur) end end
+X.reapply = Reapply
+X.qc = function() Reapply(); X.schedBuild(); X.schedParts(); X.glossOn(); X.stepLights() end
+local function stopTr() if tr then tr:Disconnect(); tr = nil end end
+
+local function Refresh(smooth) -- smooth = 1.2s eased transition (event-driven: connection lives only while it runs)
+	if not S.enabled then return end
+	stopTr()
+	local tgt = Resolve()
+	if not smooth or not cur then cur = tgt; ApplyVals(cur) return end
+	for k in pairs(cur) do if tgt[k] == nil then cur[k] = nil end end
+	local from = {}
+	for k, v in pairs(cur) do from[k] = v end
+	local t = 0
+	tr = RS.Heartbeat:Connect(function(dt)
+		t += dt / 1.2
+		local e = t >= 1 and 1 or t * t * (3 - 2 * t)
+		for k, v in pairs(tgt) do
+			local f = from[k]
+			cur[k] = f and (f + (v - f) * e) or v
+		end
+		ApplyVals(cur)
+		if t >= 1 then stopTr() end
+	end)
+end
+
+---------------------------------------------------------------- performance monitor (one light Heartbeat while enabled)
+local mon
+local function stopMon() if mon then mon:Disconnect(); mon = nil end end
+local win -- window (assigned later)
+local function startMon()
+	if mon then return end
+	local acc, frames, lowT, highT, a5, a10, a2 = 0, 0, 0, 0, 0, 0, 0
+	mon = RS.Heartbeat:Connect(function(dt)
+		acc += dt; frames += 1; a5 += dt; a10 += dt; a2 += dt
+		if a10 >= 0.1 then X.tick10(a10); a10 = 0 end
+		if a5 >= 0.2 then X.tick5(); a5 = 0 end
+		if a2 >= 2 then X.tick2(); a2 = 0 end
+		if acc < 1 then return end
+		local fps, ms = frames / acc, acc / frames * 1000
+		acc, frames = 0, 0
+		local maxQ = table.find(QN, S.quality) or 3
+		local eff = math.min(maxQ, autoCap)
+		if S.autoperf and not S.lowPerf then
+			if fps < S.target then lowT += 1; highT = 0
+			elseif fps > S.target + 15 then highT += 1; lowT = 0
+			else lowT, highT = 0, 0 end
+			if lowT >= 4 and eff > 1 then autoCap = eff - 1; lowT = 0; X.qc(); notify("Auto-optimize: quality lowered")
+			elseif highT >= 12 and autoCap < maxQ then autoCap += 1; highT = 0; X.qc(); notify("Auto-optimize: quality restored") end
+			eff = math.min(maxQ, autoCap)
+		end
+		if perfL and win and win.Visible then perfL.Text = string.format("%d FPS  %.1f ms  %s", fps, ms, S.lowPerf and "Low*" or QN[eff]) end
+	end)
+end
+
+local function Enable(on)
+	S.enabled = on
+	stopTr()
+	if on then
+		setGame(true)
+		cc.Enabled, bloom.Enabled, sun.Enabled = true, true, true
+		atmo.Parent = Lighting
+		startMon()
+		cur = nil
+		Refresh(false)
+		X.buildClouds(); X.syncParts(); X.syncCam(); X.syncFx(); X.Bars(); X.glossOn(); X.stepLights()
+	else
+		stopMon()
+		X.clearClouds(); X.syncParts(); X.syncCam(); X.syncFx(); X.glossOff(); X.restoreLights(); X.Bars()
+		cc.Enabled, bloom.Enabled, bloom2.Enabled, sun.Enabled, dof.Enabled = false, false, false, false, false
+		atmo.Parent = nil
+		setGame(false)
+		for p, v in pairs(orig) do pcall(function() Lighting[p] = v end) end
+		if canTech then pcall(sethiddenproperty, Lighting, "Technology", origTech) end
+		if origMat ~= nil then pcall(function() MS.Use2022Materials = origMat end) end
+		if terrain and ow then terrain.WaterColor, terrain.WaterTransparency, terrain.WaterReflectance = ow.c, ow.t, ow.r end
+		X.restore()
+		for _, g in ipairs(vigG) do g.Parent.Visible = false end
+		last = {}
+	end
+end
+
+---------------------------------------------------------------- config
+local FILE = "TripleEraShader_config.json"
+local function Save()
+	if not writefile then notify("This executor has no writefile") return end
+	local ok = pcall(function() writefile(FILE, HS:JSONEncode({S = S, U = U, CU = CU})) end)
+	notify(ok and "Settings saved" or "Save failed")
+end
+local function Load()
+	if not (isfile and readfile and isfile(FILE)) then return false end
+	local ok, d = pcall(function() return HS:JSONDecode(readfile(FILE)) end)
+	if not ok or type(d) ~= "table" then return false end
+	for k, v in pairs(d.S or {}) do if DEFS[k] ~= nil and type(v) == type(DEFS[k]) then S[k] = v end end
+	for k, v in pairs(d.U or {}) do if DEFU[k] ~= nil and type(v) == "number" then U[k] = v end end
+	for k, v in pairs(d.CU or {}) do if type(v) == "number" and ERA.Medieval[k] ~= nil then CU[k] = v end end
+	if not ERA[S.era] then S.era = DEFS.era end
+	if not TOD[S.tod] then S.tod = DEFS.tod end
+	if not WX[S.weather] then S.weather = DEFS.weather end
+	if not SEAS[S.season] then S.season = DEFS.season end
+	if not table.find(QN, S.quality) then S.quality = DEFS.quality end
+	if not X.CS[S.cloudStyle] then S.cloudStyle = DEFS.cloudStyle end
+	if S.fogMode ~= "Atmosphere" and S.fogMode ~= "Classic" then S.fogMode = DEFS.fogMode end
+	if S.particles ~= "Off" and not X.PT[S.particles] then S.particles = DEFS.particles end
+	if not TONE[S.tone] then S.tone = DEFS.tone end
+	if not GRADE[S.grade] then S.grade = DEFS.grade end
+	return true
+end
+
+---------------------------------------------------------------- cleanup
+local gui
+local function Unload()
+	pcall(Enable, false)
+	stopTr(); stopMon()
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	for _, e in ipairs({cc, bloom, bloom2, sun, dof, atmo}) do pcall(function() e:Destroy() end) end
+	for _, e in ipairs(X.extra) do pcall(function() e:Destroy() end) end
+	pcall(function() RS:UnbindFromRenderStep("TERA_Cam") end)
+	pcall(function() RS:UnbindFromRenderStep("TERA_Fx") end)
+	pcall(function() gui:Destroy() end)
+	pcall(function() ov:Destroy() end)
+	G.__TERA = nil
+end
+G.__TERA = Unload
+
+---------------------------------------------------------------- UI (sidebar layout)
+local BG, PANEL, PANEL2, OFF = Color3.fromRGB(14,14,18), Color3.fromRGB(26,26,33), Color3.fromRGB(36,36,46), Color3.fromRGB(62,62,74)
+local GOLD, TXT, SUB, DARK = Color3.fromRGB(214,178,98), Color3.fromRGB(236,232,222), Color3.fromRGB(150,146,136), Color3.fromRGB(20,18,14)
+local GREEN, AMBER, GREY = Color3.fromRGB(110,200,130), Color3.fromRGB(230,180,80), Color3.fromRGB(150,150,160)
+local FONT, FONTB, FONTM = Enum.Font.Gotham, Enum.Font.GothamBold, Enum.Font.GothamMedium
+local function tw(o, p, t) TS:Create(o, TweenInfo.new(t or 0.15, Enum.EasingStyle.Quad), p):Play() end
+local function corner(o, r) N("UICorner", {CornerRadius = UDim.new(0, r or 8)}, o) end
+local function LL(par, pad) return N("UIListLayout", {Padding = UDim.new(0, pad or 6), SortOrder = Enum.SortOrder.LayoutOrder}, par) end
+local function label(par, text, size, col, font, xa, props)
+	local p = {BackgroundTransparency=1, Text=text, TextSize=size, TextColor3=col, Font=font or FONT, TextXAlignment=xa or Enum.TextXAlignment.Left}
+	for k, v in pairs(props or {}) do p[k] = v end
+	return N("TextLabel", p, par)
+end
+local function btn(par, props) props.AutoButtonColor = false; return N("TextButton", props, par) end
+local function isPress(i) return i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch end
+local function isMove(i) return i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch end
+local reg = {}
+local function refreshAll() for _, f in ipairs(reg) do f() end end
+
+gui = N("ScreenGui", {Name="TERA_UI", ResetOnSpawn=false, IgnoreGuiInset=true, DisplayOrder=999, ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end end)
+win = N("Frame", {Size=UDim2.fromOffset(640,400), AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5), BackgroundColor3=Color3.new(1,1,1), BorderSizePixel=0, ClipsDescendants=true}, gui)
+N("UIGradient", {Color=ColorSequence.new(Color3.fromRGB(24,24,33), Color3.fromRGB(10,10,14)), Rotation=90}, win)
+corner(win, 14)
+N("UIStroke", {Color=GOLD, Thickness=1, Transparency=0.65}, win)
+
+-- header
+local header = N("Frame", {Size=UDim2.new(1,0,0,44), BackgroundColor3=Color3.fromRGB(18,18,23), BorderSizePixel=0, Active=true}, win)
+label(header, "ULTRA REALISM  v8", 14, GOLD, FONTB, nil, {Position=UDim2.fromOffset(16,5), Size=UDim2.new(1,-150,0,18)})
+local subL = label(header, "", 11, SUB, nil, nil, {Position=UDim2.fromOffset(16,23), Size=UDim2.new(1,-150,0,14), TextTruncate=Enum.TextTruncate.AtEnd})
+reg[#reg + 1] = function() subL.Text = (INFO[S.era] and INFO[S.era][1] or S.era) .. "  ·  " .. S.tod .. "  ·  " .. S.weather end
+local hb = touch and 34 or 28
+local function hBtn(txt, x)
+	local b = btn(header, {Size=UDim2.fromOffset(hb,hb), Position=UDim2.new(1,x,0.5,-hb/2), BackgroundColor3=PANEL2, Text=txt, TextColor3=TXT, Font=FONTB, TextSize=15})
+	corner(b, 6)
+	return b
+end
+local bMin, bMax, bClose = hBtn("–", -(hb*3+20)), hBtn("+", -(hb*2+14)), hBtn("×", -(hb+8))
+
+-- body: sidebar + content
+local body = N("Frame", {Size=UDim2.new(1,0,1,-44), Position=UDim2.fromOffset(0,44), BackgroundTransparency=1}, win)
+local SW = 124
+local side = N("Frame", {Size=UDim2.new(0,SW,1,0), BackgroundColor3=Color3.fromRGB(18,18,23), BorderSizePixel=0}, body)
+local tabList = N("ScrollingFrame", {Size=UDim2.new(1,-12,1,-104), Position=UDim2.fromOffset(6,8), BackgroundTransparency=1, BorderSizePixel=0,
+	ScrollBarThickness=0, CanvasSize=UDim2.new(), AutomaticCanvasSize=Enum.AutomaticSize.Y}, side)
+LL(tabList, 4)
+local bottom = N("Frame", {Size=UDim2.new(1,-12,0,92), Position=UDim2.new(0,6,1,-98), BackgroundTransparency=1}, side)
+local master = btn(bottom, {Size=UDim2.new(1,0,0,RH), BackgroundColor3=GOLD, Text="SHADERS ON", Font=FONTB, TextSize=12, TextColor3=DARK})
+corner(master, 8)
+perfL = label(bottom, "", 11, GOLD, FONTM, Enum.TextXAlignment.Center, {Position=UDim2.new(0,0,0,RH+6), Size=UDim2.new(1,0,0,34), TextWrapped=true})
+local content = N("Frame", {Size=UDim2.new(1,-(SW+16),1,-16), Position=UDim2.fromOffset(SW+8,8), BackgroundTransparency=1, ClipsDescendants=true}, body)
+foot = label(content, "", 12, TXT, FONTM, Enum.TextXAlignment.Center, {Size=UDim2.new(0.85,0,0,26), AnchorPoint=Vector2.new(0.5,1), Position=UDim2.new(0.5,0,1,-4),
+	BackgroundColor3=PANEL2, BackgroundTransparency=1, TextTransparency=1, ZIndex=5})
+corner(foot, 8)
+local tok = 0
+foot:GetPropertyChangedSignal("Text"):Connect(function()
+	tok += 1
+	local my, on = tok, foot.Text ~= ""
+	foot.BackgroundTransparency, foot.TextTransparency = on and 0.05 or 1, on and 0 or 1
+	if on then task.delay(2.6, function() if tok == my then foot.Text = "" end end) end
+end)
+reg[#reg + 1] = function()
+	master.Text = S.enabled and "SHADERS ON" or "SHADERS OFF"
+	tw(master, {BackgroundColor3 = S.enabled and GOLD or OFF, TextColor3 = S.enabled and DARK or TXT})
+end
+master.MouseButton1Click:Connect(function() Enable(not S.enabled); refreshAll(); notify(S.enabled and "Shaders on" or "Shaders off - game restored") end)
+
+-- tabs
+local pages, tabs = {}, {}
+local function selectTab(n)
+	for k, pg in pairs(pages) do
+		local on = k == n
+		if on and not pg.Visible then pg.Position = UDim2.fromOffset(0, 12); tw(pg, {Position = UDim2.fromOffset(0, 0)}, 0.22) end
+		pg.Visible = on
+		tabs[k].bar.Visible = on
+		tw(tabs[k].b, {BackgroundTransparency = on and 0 or 1, TextColor3 = on and TXT or SUB})
+	end
+end
+local function AddTab(name)
+	local b = btn(tabList, {Size=UDim2.new(1,0,0,RH), BackgroundColor3=PANEL2, BackgroundTransparency=1, Text=name, Font=FONTM, TextSize=13, TextColor3=SUB, TextXAlignment=Enum.TextXAlignment.Left})
+	corner(b, 8)
+	N("UIPadding", {PaddingLeft=UDim.new(0,14)}, b)
+	local bar = N("Frame", {Size=UDim2.new(0,3,0.6,0), Position=UDim2.new(0,-10,0.2,0), BackgroundColor3=GOLD, BorderSizePixel=0, Visible=false}, b)
+	corner(bar, 2)
+	local pg = N("ScrollingFrame", {Size=UDim2.fromScale(1,1), BackgroundTransparency=1, BorderSizePixel=0, ScrollBarThickness=3, ScrollBarImageColor3=GOLD,
+		CanvasSize=UDim2.new(), AutomaticCanvasSize=Enum.AutomaticSize.Y, Visible=false}, content)
+	LL(pg, 8)
+	N("UIPadding", {PaddingRight=UDim.new(0,8), PaddingBottom=UDim.new(0,34)}, pg)
+	pages[name], tabs[name] = pg, {b = b, bar = bar}
+	b.MouseButton1Click:Connect(function() selectTab(name) end)
+	return pg
+end
+
+-- components
+local function Head(pg, t) label(pg, string.upper(t), 11, GOLD, FONTB, nil, {Size=UDim2.new(1,0,0,26), TextYAlignment=Enum.TextYAlignment.Bottom}) end
+local function Note(pg, t, h) label(pg, t, 11, SUB, nil, nil, {Size=UDim2.new(1,0,0,h or 30), TextWrapped=true, TextYAlignment=Enum.TextYAlignment.Top}) end
+local function Row(pg, text, tag, col)
+	local f = N("Frame", {Size=UDim2.new(1,0,0,RH-6), BackgroundColor3=PANEL}, pg)
+	corner(f, 6)
+	label(f, text, 12, TXT, nil, nil, {Size=UDim2.new(1,-84,1,0), Position=UDim2.fromOffset(10,0), TextWrapped=true})
+	label(f, tag, 11, col, FONTB, Enum.TextXAlignment.Right, {Size=UDim2.fromOffset(70,RH-6), Position=UDim2.new(1,-78,0,0)})
+end
+local function Button(pg, text, cb)
+	local b = btn(pg, {Size=UDim2.new(1,0,0,RH), BackgroundColor3=PANEL, Text=text, Font=FONTM, TextSize=13, TextColor3=TXT})
+	corner(b, 8)
+	b.MouseEnter:Connect(function() tw(b, {BackgroundColor3=OFF}) end)
+	b.MouseLeave:Connect(function() tw(b, {BackgroundColor3=PANEL}) end)
+	b.MouseButton1Click:Connect(cb)
+end
+local function Toggle(pg, text, key, after)
+	local f = btn(pg, {Size=UDim2.new(1,0,0,RH), BackgroundColor3=PANEL, Text=""})
+	corner(f, 8)
+	label(f, text, 13, TXT, nil, nil, {Size=UDim2.new(1,-66,1,0), Position=UDim2.fromOffset(12,0), TextWrapped=true})
+	local tk = N("Frame", {Size=UDim2.fromOffset(40,22), Position=UDim2.new(1,-52,0.5,-11), BackgroundColor3=OFF}, f)
+	corner(tk, 11)
+	local kn = N("Frame", {Size=UDim2.fromOffset(18,18), Position=UDim2.fromOffset(2,2), BackgroundColor3=Color3.new(1,1,1)}, tk)
+	corner(kn, 9)
+	local function vis() local on = S[key]; tw(tk, {BackgroundColor3 = on and GOLD or OFF}); tw(kn, {Position = UDim2.fromOffset(on and 20 or 2, 2)}) end
+	f.MouseButton1Click:Connect(function() S[key] = not S[key]; vis(); if after then after() else Reapply() end end)
+	reg[#reg + 1] = vis; vis()
+end
+local function Slider(pg, text, tbl, key, mn, mx, step, after)
+	local f = N("Frame", {Size=UDim2.new(1,0,0,RH+16), BackgroundColor3=PANEL}, pg)
+	corner(f, 8)
+	label(f, text, 13, TXT, nil, nil, {Size=UDim2.new(1,-84,0,22), Position=UDim2.fromOffset(12,4)})
+	local val = label(f, "", 12, GOLD, FONTB, Enum.TextXAlignment.Right, {Size=UDim2.fromOffset(66,22), Position=UDim2.new(1,-78,0,4)})
+	local hit = btn(f, {Size=UDim2.new(1,-24,0,RH-8), Position=UDim2.fromOffset(12,28), BackgroundTransparency=1, Text=""})
+	local bar = N("Frame", {Size=UDim2.new(1,0,0,4), Position=UDim2.new(0,0,0.5,-2), BackgroundColor3=OFF, BorderSizePixel=0}, hit)
+	corner(bar, 2)
+	local fill = N("Frame", {Size=UDim2.fromScale(0,1), BackgroundColor3=GOLD, BorderSizePixel=0}, bar)
+	corner(fill, 2)
+	local knob = N("Frame", {Size=UDim2.fromOffset(16,16), AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0,0.5), BackgroundColor3=Color3.new(1,1,1)}, bar)
+	corner(knob, 8)
+	local dec = step >= 1 and 0 or (step >= 0.1 and 1 or 2)
+	local function vis()
+		local r = math.clamp((tbl[key] - mn) / (mx - mn), 0, 1)
+		fill.Size, knob.Position = UDim2.fromScale(r, 1), UDim2.fromScale(r, 0.5)
+		val.Text = string.format("%." .. dec .. "f", tbl[key])
+	end
+	local drag, sc = false, nil
+	local function setx(x)
+		local r = math.clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
+		tbl[key] = math.clamp(math.floor((mn + r * (mx - mn)) / step + 0.5) * step, mn, mx)
+		vis()
+		if after then after() else Refresh(false) end
+	end
+	hit.InputBegan:Connect(function(i)
+		if isPress(i) then
+			drag = true
+			sc = f:FindFirstAncestorWhichIsA("ScrollingFrame")
+			if sc then sc.ScrollingEnabled = false end -- no accidental page scroll while dragging
+			setx(i.Position.X)
+		end
+	end)
+	conn(UIS.InputChanged:Connect(function(i) if drag and isMove(i) then setx(i.Position.X) end end))
+	conn(UIS.InputEnded:Connect(function(i) if drag and isPress(i) then drag = false; if sc then sc.ScrollingEnabled = true end end end))
+	reg[#reg + 1] = vis; vis()
+end
+local function Choice(pg, title, key, opts, per, after)
+	if title then label(pg, title, 12, SUB, FONTM, nil, {Size=UDim2.new(1,0,0,18)}) end
+	local bs = {}
+	for i = 1, #opts, per do
+		local row = N("Frame", {Size=UDim2.new(1,0,0,RH-2), BackgroundTransparency=1}, pg)
+		N("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6), SortOrder=Enum.SortOrder.LayoutOrder}, row)
+		for j = i, math.min(i + per - 1, #opts) do
+			local o = opts[j]
+			local b = btn(row, {Size=UDim2.new(1/per, -6*(per-1)/per, 1, 0), BackgroundColor3=PANEL, Text=o, Font=FONTM, TextSize=12, TextColor3=TXT, TextWrapped=true})
+			corner(b, 8)
+			bs[o] = b
+			b.MouseButton1Click:Connect(function() S[key] = o; after(); refreshAll() end)
+		end
+	end
+	reg[#reg + 1] = function() for o, b in pairs(bs) do local on = S[key] == o; tw(b, {BackgroundColor3 = on and GOLD or PANEL, TextColor3 = on and DARK or TXT}) end end
+	reg[#reg]()
+end
+local function Card(pg, id)
+	local info = INFO[id]
+	local card = btn(pg, {Size=UDim2.new(1,0,0,RH+52), BackgroundColor3=PANEL, Text=""})
+	corner(card, 10)
+	local st = N("UIStroke", {Color=GOLD, Thickness=1.5, Transparency=0.8}, card)
+	local ttl = label(card, info[1], 14, TXT, FONTB, nil, {Size=UDim2.new(1,-20,0,20), Position=UDim2.fromOffset(12,8)})
+	label(card, info[2], 11, SUB, nil, nil, {Size=UDim2.new(1,-24,0,34), Position=UDim2.fromOffset(12,28), TextWrapped=true, TextYAlignment=Enum.TextYAlignment.Top})
+	for i, c in ipairs(info[3]) do
+		local sw = N("Frame", {Size=UDim2.fromOffset(26,8), Position=UDim2.new(0,12+(i-1)*30,1,-16), BackgroundColor3=c}, card)
+		corner(sw, 4)
+	end
+	card.MouseButton1Click:Connect(function() S.era = id; Refresh(true); refreshAll(); notify(info[1] .. " applied") end)
+	reg[#reg + 1] = function() local on = S.era == id; st.Transparency = on and 0 or 0.8; ttl.TextColor3 = on and GOLD or TXT end
+	reg[#reg]()
+end
+local noop = function() end
+
+-- themes: swap the accent colour everywhere
+local THEMES = {Gold = Color3.fromRGB(214,178,98), Ice = Color3.fromRGB(96,170,255), Emerald = Color3.fromRGB(88,200,140), Crimson = Color3.fromRGB(232,90,90), Violet = Color3.fromRGB(160,120,255)}
+local function retheme()
+	local new, old = THEMES[S.theme] or THEMES.Gold, GOLD
+	if new == old then return end
+	GOLD = new
+	for _, d in ipairs(gui:GetDescendants()) do
+		if d:IsA("GuiObject") then
+			if d.BackgroundColor3 == old then d.BackgroundColor3 = new end
+			if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.TextColor3 == old then d.TextColor3 = new end
+			if d:IsA("ScrollingFrame") and d.ScrollBarImageColor3 == old then d.ScrollBarImageColor3 = new end
+		elseif d:IsA("UIStroke") and d.Color == old then d.Color = new end
+	end
+	refreshAll()
+end
+
+-- one-tap looks
+local function Chips(pg, list, per, cb)
+	for i = 1, #list, per do
+		local row = N("Frame", {Size=UDim2.new(1,0,0,RH-2), BackgroundTransparency=1}, pg)
+		N("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6), SortOrder=Enum.SortOrder.LayoutOrder}, row)
+		for j = i, math.min(i + per - 1, #list) do
+			local name = list[j]
+			local b = btn(row, {Size=UDim2.new(1/per, -6*(per-1)/per, 1, 0), BackgroundColor3=PANEL, Text=name, Font=FONTB, TextSize=12, TextColor3=GOLD})
+			corner(b, 8)
+			N("UIStroke", {Color=GOLD, Thickness=1, Transparency=0.6}, b)
+			b.MouseButton1Click:Connect(function() cb(name) end)
+		end
+	end
+end
+local LOOKS = {
+	Photoreal = {S = {shadowDepth=1.15, fogAmt=1.2, flare=true, flareAmt=0.8, tone="Filmic", grade="None", bloomWide=true, contact=true, gloss=true, scatter=true, dawnMist=true, vig=0.2, particles="Dust", cloudsOn=true, cloudCover=0.6, bars=false, orbit=false}, U = {intensity=1, bloom=0.8}},
+	Cinematic = {S = {tone="Filmic", grade="Warm Film", flareAmt=1.2, bars=true, vig=0.4, dof=true, autoFocus=true, sway=true, shadowDepth=1.25, bloomWide=true}, U = {intensity=1.15, bloom=1.1}},
+	Dreamy = {S = {tone="Soft", grade="Vivid", fogAmt=1.8, flareAmt=1.3, vig=0.3, particles="Fireflies", bars=false}, U = {bloom=1.5, haze=1.4}},
+	Stormy = {S = {weather="Rain", tone="Punchy", grade="Cool Steel", particles="Rain", lensDrops=true, fogAmt=2, cloudStyle="Storm", cloudCover=1, shadowDepth=0.9}, U = {rays=0.3, bloom=0.8}},
+}
+local function applyLook(name)
+	local L = LOOKS[name]
+	for k, v in pairs(L.S) do S[k] = v end
+	for k, v in pairs(L.U) do U[k] = v end
+	Refresh(true); X.schedBuild(); X.schedParts(); X.syncFx(); X.syncCam(); X.Bars(); X.glossOn(); X.stepLights(); X.glossUpdate()
+	refreshAll(); notify(name .. " look applied")
+end
+
+-- Looks
+local p = AddTab("Looks")
+Head(p, "Quick looks")
+Chips(p, {"Photoreal", "Cinematic", "Dreamy", "Stormy"}, 2, applyLook)
+Head(p, "Historical era")
+for _, id in ipairs({"Medieval", "Samurai", "China"}) do Card(p, id) end
+Head(p, "Time of day")
+Choice(p, nil, "tod", TOD_ORDER, 3, function() Refresh(true) end)
+Head(p, "Weather look (grade only)")
+Choice(p, nil, "weather", WX_ORDER, 3, function() Refresh(true); X.glossUpdate() end)
+Head(p, "Season colour")
+Choice(p, nil, "season", SEAS_ORDER, 4, function() Refresh(true) end)
+Head(p, "Strength")
+Slider(p, "Preset strength", U, "intensity", 0, 1.5, 0.05)
+
+-- Sky
+p = AddTab("Sky")
+Head(p, "Sun & moon")
+Slider(p, "Sun size", S, "sunSize", 5, 60, 1, Reapply)
+Slider(p, "Moon size", S, "moonSize", 5, 40, 1, Reapply)
+Slider(p, "Star density", S, "stars", 0, 8000, 250, Reapply)
+Toggle(p, "Show sun & moon", "bodies")
+Slider(p, "Sun path latitude", S, "lat", 0, 70, 1, Reapply)
+Slider(p, "Day cycle speed (hrs/sec)", S, "cycle", 0, 0.5, 0.01, Reapply)
+Head(p, "3D clouds")
+Toggle(p, "3D clouds (Medium+)", "cloudsOn", X.schedBuild)
+Choice(p, nil, "cloudStyle", {"Cumulus", "Stratus", "Storm"}, 3, X.schedBuild)
+Slider(p, "Coverage", S, "cloudCover", 0.1, 1, 0.05, X.schedBuild)
+Slider(p, "Cloud size", S, "cloudScale", 0.5, 2.5, 0.1, X.schedBuild)
+Slider(p, "Height above you", S, "cloudAlt", 150, 1200, 10, noop)
+Slider(p, "Softness", S, "cloudSoft", 0, 0.8, 0.05, X.cloudLook)
+Slider(p, "Wind speed", S, "windSpd", 0, 60, 1, noop)
+Slider(p, "Wind direction", S, "windDir", 0, 359, 5, noop)
+Head(p, "Engine cloud layer")
+Toggle(p, "Engine clouds", "engClouds")
+Slider(p, "Cover", S, "engCover", 0, 1, 0.05, Reapply)
+Slider(p, "Density", S, "engDens", 0, 1, 0.05, Reapply)
+
+Head(p, "Weather particles")
+Choice(p, nil, "particles", {"Off", "Rain", "Snow", "Dust", "Fireflies"}, 3, X.schedParts)
+Slider(p, "Particle amount", S, "partAmt", 0.2, 2, 0.1, X.schedParts)
+Toggle(p, "Rain drops on lens", "lensDrops")
+Toggle(p, "Dawn mist", "dawnMist")
+
+-- Light
+p = AddTab("Light")
+Head(p, "Shadows")
+Slider(p, "Shadow depth", S, "shadowDepth", 0, 1.5, 0.05, Reapply)
+Slider(p, "Shadow softness", U, "shadow", 0, 1.5, 0.05)
+Slider(p, "Ambient occlusion depth", S, "skyAmb", 0, 1.5, 0.05, Reapply)
+Toggle(p, "Contact shadows (character)", "contact", X.syncFx)
+Toggle(p, "Dynamic light shadows", "lightSh", X.stepLights)
+Slider(p, "Max shadowed lights", S, "maxLights", 1, 10, 1, X.stepLights)
+Head(p, "Lanterns (night)")
+Slider(p, "Warm tint", S, "lantWarm", 0, 1, 0.05, X.stepLights)
+Slider(p, "Brightness", S, "lantBoost", 1, 2.5, 0.05, X.stepLights)
+Head(p, "Reflections & materials")
+Slider(p, "Reflection boost", U, "spec", 0, 1.5, 0.1)
+Toggle(p, "Glossy stone, glass & metal", "gloss", X.glossOn)
+Slider(p, "Gloss amount", S, "glossAmt", 0.02, 0.3, 0.01, X.glossUpdate)
+Toggle(p, "2022 PBR materials", "pbr")
+
+-- Fog & Water
+p = AddTab("Fog & Water")
+Head(p, "Distance fog")
+Choice(p, nil, "fogMode", {"Atmosphere", "Classic"}, 2, Reapply)
+Slider(p, "Fog thickness", S, "fogAmt", 0, 3, 0.1, Reapply)
+Slider(p, "Classic fog distance", S, "fogDist", 300, 4000, 50, Reapply)
+Toggle(p, "Sun-angle sky & fog colour", "scatter")
+Slider(p, "Haze", U, "haze", 0, 2, 0.05)
+Slider(p, "Sun glare in air", U, "glare", 0, 2, 0.05)
+Slider(p, "God rays", U, "rays", 0, 2, 0.05)
+Head(p, "Water")
+Toggle(p, "Water enhancement", "water")
+Slider(p, "Wave height", S, "waveSize", 0, 1, 0.05, Reapply)
+Slider(p, "Wave speed", S, "waveSpd", 0, 30, 1, Reapply)
+Toggle(p, "Underwater look", "uw")
+Head(p, "Terrain")
+Toggle(p, "Lush grass", "lush")
+Slider(p, "Grass length", S, "grass", 0.1, 1, 0.05, Reapply)
+
+-- Lens
+p = AddTab("Lens")
+Head(p, "Sun lens flare")
+Toggle(p, "Lens flare (Medium+)", "flare", X.syncFx)
+Slider(p, "Flare strength", S, "flareAmt", 0, 2, 0.1, noop)
+Toggle(p, "Auto exposure near sun", "autoExp")
+Toggle(p, "Sun-facing glare", "sunGlare")
+Toggle(p, "Eye adaptation (indoors)", "eyeAdapt")
+Head(p, "Tone curve & colour grade")
+Choice(p, nil, "tone", {"Neutral", "Filmic", "Punchy", "Soft"}, 4, function() Refresh(true) end)
+Choice(p, nil, "grade", {"None", "Warm Film", "Cool Steel", "Bleach", "Vivid"}, 3, function() Refresh(true) end)
+Head(p, "Bloom & grade")
+Slider(p, "Bloom amount", U, "bloom", 0, 2, 0.05)
+Toggle(p, "Wide HDR bloom", "bloomWide")
+Slider(p, "Exposure", U, "exposure", -0.5, 0.5, 0.05)
+Slider(p, "Contrast", U, "contrast", -0.3, 0.3, 0.02)
+Slider(p, "Saturation", U, "sat", -0.3, 0.3, 0.02)
+Slider(p, "Warmth", U, "warmth", -1, 1, 0.05)
+Slider(p, "Vignette", S, "vig", 0, 0.8, 0.05, Reapply)
+
+-- Camera
+p = AddTab("Camera")
+Head(p, "Movement")
+Toggle(p, "Head bob", "bob", X.syncCam)
+Slider(p, "Bob strength", S, "bobAmt", 0.2, 2, 0.1, noop)
+Toggle(p, "Lean into strafing", "tilt", X.syncCam)
+Slider(p, "Lean amount", S, "tiltAmt", 0.2, 2, 0.1, noop)
+Toggle(p, "Landing impact", "landing", X.syncCam)
+Toggle(p, "Speed FOV kick", "speedFov", X.syncCam)
+Slider(p, "Zoom FOV (hold Z)", S, "zoomFov", 10, 60, 1, noop)
+Button(p, "Tap to toggle zoom (touch)", function() X.zoomOn = not X.zoomOn; X.zoom(X.zoomOn) end)
+Head(p, "Cinematic")
+Toggle(p, "Orbit camera around you", "orbit", X.syncCam)
+Slider(p, "Orbit speed", S, "orbitSpd", 0.05, 1, 0.05, noop)
+Slider(p, "Orbit distance", S, "orbitDist", 6, 40, 1, noop)
+Toggle(p, "Handheld breathing", "sway", X.syncCam)
+Toggle(p, "Motion blur", "mblur", X.syncCam)
+Toggle(p, "Letterbox bars", "bars", X.Bars)
+Head(p, "Focus")
+Toggle(p, "Distance blur (DoF)", "dof")
+Slider(p, "Distance blur amount", S, "dofAmt", 0, 1, 0.05, Reapply)
+Toggle(p, "Auto-focus", "autoFocus")
+Slider(p, "Manual focus distance", S, "focusDist", 10, 300, 5, noop)
+
+-- Performance
+p = AddTab("Performance")
+Head(p, "Quality")
+Choice(p, nil, "quality", QN, 2, function() autoCap = 4; X.qc() end)
+Toggle(p, "Low-performance mode", "lowPerf", function() autoCap = 4; X.qc(); notify(S.lowPerf and "Low-performance mode on" or "Low-performance mode off") end)
+Toggle(p, "Auto-optimize when FPS drops", "autoperf", function() autoCap = 4; X.qc() end)
+Slider(p, "Target FPS", S, "target", 20, 90, 5, noop)
+Head(p, "Frame rate & renderer")
+Button(p, "Cap FPS to 60", function() if setfpscap then setfpscap(60); notify("FPS capped to 60") else notify("setfpscap not available here") end end)
+Button(p, "Uncap FPS", function() if setfpscap then setfpscap(0); notify("FPS uncapped") else notify("setfpscap not available here") end end)
+Button(p, "Roblox render quality: max", function() pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level21 end); notify("Render quality: max") end)
+Button(p, "Roblox render quality: low", function() pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level05 end); notify("Render quality: low") end)
+
+-- System
+p = AddTab("System")
+Head(p, "Theme")
+Choice(p, nil, "theme", {"Gold", "Ice", "Emerald", "Crimson", "Violet"}, 3, retheme)
+Head(p, "Settings")
+Button(p, "Save settings", Save)
+Button(p, "Load settings", function()
+	if Load() then autoCap = 4; refreshAll(); Enable(S.enabled); notify("Settings loaded") else notify("No saved settings found") end
+end)
+Button(p, "Reset to defaults", function() resetAll(); autoCap = 4; refreshAll(); Enable(true); notify("Reset to defaults") end)
+Button(p, "Unload script (restore game)", function() if G.__TERA then G.__TERA() end end)
+Head(p, "Real")
+for _, t in ipairs({"Sun shadows via Future lighting", "Shadow softness", "Light shadows on nearest lights", "Sun-angle sky + fog colour", "Atmosphere and classic fog", "Screen-space lens flare + occlusion", "Two-stage HDR bloom", "Sun rays (god rays)", "Auto exposure", "3D clouds", "Water waves + reflectance", "Underwater look", "Auto-focus depth of field", "Motion blur"}) do Row(p, t, "REAL", GREEN) end
+for _, t in ipairs({"Head bob, lean, landing, speed FOV", "Hold-Z zoom + orbit camera", "Rain / snow / dust / fireflies", "Rain drops on lens", "Tone curves + colour grades", "Dawn mist"}) do Row(p, t, "REAL", GREEN) end
+Head(p, "Approximate")
+for _, t in ipairs({"Contact shadows (character only)", "Ambient occlusion look", "Reflections (Reflectance, sky only)", "PBR (2022 materials only)", "Volumetric light (screen-space)"}) do Row(p, t, "APPROX", AMBER) end
+Head(p, "Not possible here")
+for _, t in ipairs({"Screen-space reflections", "Cascade / acne / flicker control", "Custom PBR maps", "True volumetrics", "Ray tracing", "Film grain / chromatic aberration"}) do Row(p, t, "NO", GREY) end
+
+-- window behaviour
+local open, minimized, maxim = true, false, false
+local function layout()
+	local vp = cam.ViewportSize
+	local w, h = math.clamp(vp.X * 0.94, 340, 700), math.clamp(vp.Y * 0.9, 260, 460)
+	if maxim then w, h = vp.X * 0.97, vp.Y * 0.94 end
+	if minimized then h = 44 end
+	local sw = w < 480 and 96 or 124
+	side.Size = UDim2.new(0, sw, 1, 0)
+	content.Position, content.Size = UDim2.fromOffset(sw + 8, 8), UDim2.new(1, -(sw + 16), 1, -16)
+	body.Visible = not minimized
+	tw(win, {Size = UDim2.fromOffset(w, h)}, 0.2)
+end
+local function setOpen(v) open = v; win.Visible = v end
+bMin.MouseButton1Click:Connect(function() minimized = not minimized; layout() end)
+bMax.MouseButton1Click:Connect(function() maxim = not maxim; minimized = false; layout() end)
+bClose.MouseButton1Click:Connect(function() setOpen(false); notify("Menu hidden - tap the gold button or press RightShift") end)
+conn(cam:GetPropertyChangedSignal("ViewportSize"):Connect(layout))
+
+local fab = btn(gui, {Size=UDim2.fromOffset(46,46), AnchorPoint=Vector2.new(1,0.5), Position=UDim2.new(1,-10,0.45,0), BackgroundColor3=GOLD, Text="UR", Font=FONTB, TextSize=14, TextColor3=DARK})
+corner(fab, 23)
+fab.MouseButton1Click:Connect(function() setOpen(not open); if open then layout() end end)
+
+local dragW, dStart, dPos = false
+header.InputBegan:Connect(function(i) if isPress(i) then dragW, dStart, dPos = true, i.Position, win.Position end end)
+conn(UIS.InputChanged:Connect(function(i)
+	if dragW and isMove(i) then
+		local d = i.Position - dStart
+		win.Position = UDim2.new(dPos.X.Scale, dPos.X.Offset + d.X, dPos.Y.Scale, dPos.Y.Offset + d.Y)
+	end
+end))
+conn(UIS.InputEnded:Connect(function(i) if isPress(i) then dragW = false end end))
+conn(UIS.InputBegan:Connect(function(i, gp)
+	if gp then return end
+	if i.KeyCode == Enum.KeyCode.RightShift then setOpen(not open)
+	elseif i.KeyCode == Enum.KeyCode.K then Enable(not S.enabled); refreshAll(); notify(S.enabled and "Shaders on" or "Shaders off - game restored")
+	elseif i.KeyCode == Enum.KeyCode.Z then X.zoom(true) end
+end))
+conn(UIS.InputEnded:Connect(function(i) if i.KeyCode == Enum.KeyCode.Z then X.zoomOn = false; X.zoom(false) end end))
+
+---------------------------------------------------------------- start
+if Load() then notify("Saved settings loaded") end
+gui.Parent = guiParent()
+retheme()
+selectTab("Looks")
+layout()
+Enable(S.enabled)
+refreshAll()
+notify("Ready - pick an era in Looks")
